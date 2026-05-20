@@ -125,31 +125,87 @@ and verifies it publishes `Float64MultiArray` commands when fed a synthetic
 - **`A module that was compiled using NumPy 1.x cannot be run in NumPy 2.x`**:
   ran `pip install` without the version pin.  Re-run
   `pip3 install --user --break-system-packages 'numpy<2' 'opencv-python<4.10'`.
-- **Pose debug image freezes after 1–2 frames, with `Hardware Notification: Depth
-  stream start failure` / `get_xu(ctrl=1) failed! Last Error: Device or resource
-  busy` in the log**: the D415 was left in a half-open state by a previous run
-  (e.g. Ctrl-C didn't reach the realsense node fast enough).  `camera.launch.py`
-  already passes `initial_reset:=true` which hardware-resets the camera on
-  startup, so this should self-heal on the *next* launch.  If you still see it,
-  physically unplug+replug the D415 and relaunch; on persistent systems also
-  add `sudo bash -c 'echo -1 > /sys/module/usbcore/parameters/autosuspend'`.
-- **Heartbeats from `humanoid_pose_estimator` go to `in=0 out=0` the moment
-  Gazebo finishes loading**: realsense's USB transfer thread is being starved
-  by the bring-up CPU spike, and once the D415's UVC buffer overruns the
-  camera silently stops delivering frames for the rest of the run.
-  `demo.launch.py` already mitigates this by:
-    (a) **CPU affinity** -- the realsense node and `pose_estimator_node` are
-        pinned to cores 0-1 via `taskset`, and Gazebo + RViz are pinned to
-        cores 2-3.  This is the load-bearing fix.
-    (b) bringing the camera up first and waiting 12 s before Gazebo, and
-    (c) defaulting `use_rviz:=false`.
-  If you still see it, verify cores are isolated with
-  `ps -o pid,psr,comm -C realsense2_camera_,gz,rviz2` -- realsense should sit
-  on CPU 0 or 1, gz on 2 or 3.  For the pose-debug image, run
-  `ros2 run rqt_image_view rqt_image_view` in another terminal and select
-  `/human/debug_image`, or open RViz manually *after* the demo's heartbeats
-  are steady (still keeping it off the camera's cores):
+- **Pose debug image freezes after 1–2 frames, with
+  `xioctl(VIDIOC_S_FMT) failed, errno=5 Input/output error` in the
+  realsense log and a `Device with physical ID /sys/.../video4linux/videoN`
+  whose `N` *changed* mid-run**: this is the D415 re-enumerating itself
+  on the USB bus, which the realsense node interprets as the device
+  disappearing mid-stream and then trips ``VIDIOC_S_FMT`` when it tries
+  to re-configure the new ``/dev/videoN``.  We used to set
+  ``initial_reset:=true`` on the realsense node to clear "Device or
+  resource busy" from prior unclean shutdowns, but on the D415 that
+  reset is asynchronous -- librealsense returns immediately, the kernel
+  re-enumerates the device 5-6 s later with a new ``/dev/videoN``, and
+  that arrives mid-stream and kills the sensor.  ``camera.launch.py``
+  now sets ``initial_reset:=false`` for this reason.
+- **`get_xu(ctrl=1) failed! Last Error: Device or resource busy` on the
+  *very first* launch after killing a previous one with Ctrl-C / SIGKILL**:
+  the D415 was left in a half-open state by the previous run because
+  the realsense node didn't get to drain its USB endpoints.  Recovery:
+  physically unplug+replug the D415 once, or on persistent systems run
+  `sudo bash -c 'echo -1 > /sys/module/usbcore/parameters/autosuspend'`
+  to let the kernel power-cycle the port automatically.  We deliberately
+  do *not* enable ``initial_reset:=true`` to paper over this -- the
+  reset itself causes a worse failure mode (see entry above).
+- **Heartbeats from `humanoid_pose_estimator` go to `in=0 out=0` shortly
+  after Gazebo starts, but `ros2 topic hz /camera/camera/color/image_raw`
+  in another terminal still shows the topic publishing at ~10-30 Hz**:
+  this is a *Cyclone DDS subscription death*.  When gazebo + ros2_control
+  bring ~6 new DDS participants onto the bus in a ~2 s window, Cyclone's
+  participant gets poisoned and any pre-existing subscriber<->writer
+  match silently un-pairs.  After that the writer keeps publishing
+  happily but the reader is permanently disconnected, and re-creating
+  the subscription from the *same* participant doesn't help (we tried
+  -- the watchdog in ``pose_estimator_node`` retries 3 times then logs
+  an ``ERROR`` recommending you swap DDS stacks).
+
+  **This is already fixed by default**: ``demo.launch.py`` runs a
+  ``SetEnvironmentVariable("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")``
+  at the top of the launch description, which overrides Jazzy's default
+  Cyclone with Fast-DDS for the entire demo.  Fast-DDS' discovery is
+  robust to the same bring-up storm.  If you want Cyclone back for some
+  reason, ``export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`` *before*
+  ``ros2 launch`` -- the launch file honours an explicitly-set env var.
+
+  Secondary mitigations that the demo still applies in case the
+  subscription dies anyway:
+
+    - **Subscription watchdog**: ``pose_estimator_node`` runs a 2 s
+      timer that, after seeing color frames go silent for >= 5 s,
+      tears down and re-creates all three image subscriptions.  You'll
+      see a `WARN` line ``No color frames for X.Xs ... Rebuilding
+      subscriptions (attempt #N)`` in the log, and the next heartbeat
+      will start showing `in=...` with a `resub=N` suffix.  If
+      ``resub=N`` keeps climbing without ever seeing ``in>0``, the
+      DDS *participant* is poisoned (not just the reader) and you need
+      to swap DDS stacks -- the watchdog will escalate to a single
+      ``ERROR`` line at attempt #4 with that exact recommendation.
+    - **CPU affinity**: realsense + pose_estimator pinned to cores 0-1
+      via ``taskset``, gazebo + rviz to cores 2-3.  Verify with
+      ``ps -o pid,psr,comm -C realsense2_camera_,gz,rviz2``.
+    - ``headless:=true``: gazebo server-only (no Ogre2), avoids any
+      fight with MediaPipe's EGL context on a shared Intel iGPU.
+      Recommended on the Intel N100.
+    - ``bringup_order:=gazebo_first``: gazebo at t=0, camera at t=30
+      so the camera comes up in a quiet steady-state environment.
+      Bring-up time ~35 s vs ~15 s for the default ``camera_first``.
+
+  For the pose-debug image, in another terminal run
+  `ros2 run rqt_image_view rqt_image_view` and select `/human/debug_image`,
+  or open RViz manually *after* the demo's heartbeats are steady (still
+  keeping it off the camera's cores):
   `taskset -c 2,3 ros2 run rviz2 rviz2 -d src/humanoid_mimic_bringup/rviz/demo.rviz`.
+- **`Failed to load system plugin [gz_ros2_control-system] : Could not find
+  shared library` in the gazebo log, followed by spawners that hang on
+  `waiting for service /controller_manager/list_controllers`, and a
+  G1 whose arms swing freely under gravity**: gazebo can't find
+  `libgz_ros2_control-system.so` (in `/opt/ros/jazzy/lib`) because the
+  custom `gz sim` ExecuteProcess we use (so we can `taskset` it) doesn't
+  go through `ros_gz_sim`'s launch file, which is what normally folds
+  `LD_LIBRARY_PATH` into `GZ_SIM_SYSTEM_PLUGIN_PATH`.  `sim.launch.py`
+  now does that injection itself; if you still see the error, double-check
+  that `/opt/ros/jazzy/setup.bash` was sourced *before* `ros2 launch`
+  (otherwise `LD_LIBRARY_PATH` has no ROS entries to inherit).
 
 ## Credits / licenses
 

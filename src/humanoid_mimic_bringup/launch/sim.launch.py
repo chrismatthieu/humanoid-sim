@@ -21,7 +21,9 @@ from launch.actions import (
     ExecuteProcess,
     OpaqueFunction,
     RegisterEventHandler,
+    Shutdown,
 )
+from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
@@ -88,11 +90,26 @@ def generate_launch_description() -> LaunchDescription:
     bringup_share_dir = get_package_share_directory("humanoid_mimic_bringup")
     g1_share = get_package_share_directory("g1_description")
     extra_resource = os.path.dirname(g1_share)  # parent so package:// resolves
-    existing = os.environ.get("GZ_SIM_RESOURCE_PATH", "")
+    existing_res = os.environ.get("GZ_SIM_RESOURCE_PATH", "")
     os.environ["GZ_SIM_RESOURCE_PATH"] = (
-        f"{extra_resource}:{existing}" if existing else extra_resource
+        f"{extra_resource}:{existing_res}" if existing_res else extra_resource
     )
     world_path_str = os.path.join(bringup_share_dir, "worlds", "mimic.sdf")
+
+    # ``ros_gz_sim``'s gz_sim.launch.py normally folds ``LD_LIBRARY_PATH``
+    # into ``GZ_SIM_SYSTEM_PLUGIN_PATH`` so ``gz sim`` can find ROS plugins
+    # like ``libgz_ros2_control-system.so`` (which lives in
+    # /opt/ros/jazzy/lib).  We bypass that include below (see comment on
+    # ``gz_sim`` ExecuteProcess), so do the same injection ourselves --
+    # otherwise gazebo logs ``Failed to load system plugin
+    # [gz_ros2_control-system] : Could not find shared library.`` and the
+    # spawners then sit forever in "waiting for service
+    # /controller_manager/list_controllers".
+    existing_plug = os.environ.get("GZ_SIM_SYSTEM_PLUGIN_PATH", "")
+    ld_lib = os.environ.get("LD_LIBRARY_PATH", "")
+    os.environ["GZ_SIM_SYSTEM_PLUGIN_PATH"] = os.pathsep.join(
+        p for p in (existing_plug, ld_lib) if p
+    )
 
     # CPU affinity (see camera.launch.py comment about cores 0-1).  On the
     # N100 (4 cores) we pin Gazebo to cores 2-3 so it physically cannot
@@ -105,15 +122,34 @@ def generate_launch_description() -> LaunchDescription:
     # ``ros_gz_sim``'s ``gz_sim.launch.py`` because ``IncludeLaunchDescription``
     # has no ``prefix=`` knob -- the cleanest way to get ``taskset`` in
     # front of the gazebo binary is to do the ExecuteProcess directly.
-    gz_sim = ExecuteProcess(
+    # ``headless:=true`` runs gazebo server-only (no GUI), which removes
+    # the second iGPU consumer (after MediaPipe).  Use this if the camera
+    # *still* dies on gazebo start even with CPU affinity -- it strongly
+    # suggests Ogre2 + Mesa contention rather than pure CPU contention.
+    # You can still attach a gz GUI later with ``gz sim -g`` if needed.
+    headless = LaunchConfiguration("headless")
+    gz_sim_full = ExecuteProcess(
         cmd=[
             "taskset", "-c", "2,3",
             "gz", "sim", world_path_str,
             "-r", "--render-engine", "ogre2",
         ],
         output="screen",
+        condition=__import__(
+            "launch.conditions", fromlist=["UnlessCondition"]
+        ).UnlessCondition(headless),
         # If gazebo dies, tear down the whole launch.
-        on_exit=__import__("launch.actions", fromlist=["Shutdown"]).Shutdown(),
+        on_exit=Shutdown(),
+    )
+    gz_sim_headless = ExecuteProcess(
+        cmd=[
+            "taskset", "-c", "2,3",
+            "gz", "sim", world_path_str,
+            "-r", "-s", "--render-engine", "ogre2",
+        ],
+        output="screen",
+        condition=IfCondition(headless),
+        on_exit=Shutdown(),
     )
 
     # ros2_control spawners.  ``taskset -c 2,3`` keeps the spawners on
@@ -151,7 +187,7 @@ def generate_launch_description() -> LaunchDescription:
         executable="rviz2",
         name="rviz2",
         arguments=["-d", rviz_cfg],
-        condition=__import__("launch.conditions", fromlist=["IfCondition"]).IfCondition(use_rviz),
+        condition=IfCondition(use_rviz),
         output="screen",
         # Keep RViz off the camera's cores (see gazebo comment above).
         prefix="taskset -c 2,3",
@@ -159,7 +195,17 @@ def generate_launch_description() -> LaunchDescription:
 
     return LaunchDescription([
         DeclareLaunchArgument("use_rviz", default_value="false"),
-        gz_sim,
+        DeclareLaunchArgument(
+            "headless",
+            default_value="false",
+            description=(
+                "If true, run gazebo with -s (server only, no GUI).  Useful "
+                "if the iGPU contention between Ogre2 and MediaPipe is "
+                "starving the camera even with CPU affinity."
+            ),
+        ),
+        gz_sim_full,
+        gz_sim_headless,
         clock_bridge,
         OpaqueFunction(function=_build_robot_description),
         # Sequence: spawn -> jsb -> upper_body

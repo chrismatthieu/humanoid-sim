@@ -25,7 +25,7 @@ import traceback
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import cv2
 import numpy as np
@@ -183,6 +183,13 @@ class PoseEstimatorNode(Node):
         # Wall-time of when we last *entered* _on_color.  If this stops
         # advancing while the heartbeat keeps ticking, we know detect() hung.
         self._last_color_enter_t = time.monotonic()
+        # Subscription-resync bookkeeping (see _watchdog).
+        self._node_start_t = time.monotonic()
+        self._last_resubscribe_t = 0.0
+        self._resubscribe_count = 0
+        self._info_sub: Optional[Any] = None
+        self._depth_sub: Optional[Any] = None
+        self._color_sub: Optional[Any] = None
 
         self.pub_kps = self.create_publisher(PoseArray, "/human/keypoints", 10)
         self.pub_markers = self.create_publisher(MarkerArray, "/human/markers", 10)
@@ -194,6 +201,44 @@ class PoseEstimatorNode(Node):
         # that context to the calling thread, so we must keep all inference
         # on the same thread.  The deeper QoS queue absorbs inference jitter
         # (depth=10 lets ~330 ms of buffered frames survive before drops).
+        self._create_subscriptions()
+
+        # Heartbeat on a real timer (independent of color callback firing).
+        # If this keeps ticking while _on_color stops, we know detect() hung.
+        self._heartbeat_timer = self.create_timer(1.0, self._heartbeat)
+        # Subscription-resync watchdog.  When the underlying DDS reader
+        # silently unmatches from the realsense writer (a well-known
+        # Cyclone-DDS-on-Jazzy symptom triggered by bursty participant
+        # churn -- gazebo + ros2_control bring up ~6 new participants in a
+        # ~2 s window, which we observed reliably ``in=0``-freezes the
+        # subscription even though ``ros2 topic hz`` shows the topic is
+        # still being published at full rate), tear the subs down and
+        # rebuild them.  Fires every 2 s and only acts if we *had* been
+        # seeing frames and have now been silent for >= 5 s; this is
+        # cheap when healthy and self-healing when not.
+        self._watchdog_timer = self.create_timer(2.0, self._watchdog)
+
+        self.get_logger().info(
+            f"pose_estimator up; color={self.color_topic} depth={self.depth_topic} "
+            f"info={self.info_topic} frame={self.output_frame}"
+        )
+
+    # ------------------------------------------------------------------ helpers
+
+    def _create_subscriptions(self) -> None:
+        """(Re)create the camera_info / depth / color subscriptions.
+
+        Pulled into a helper so the watchdog can rebuild the readers when
+        Cyclone DDS drops the subscriber<->writer match during gazebo
+        bring-up.  Destroying the old subscription before recreating is
+        important: ``rclpy``'s subscription objects hold a reference to
+        the underlying DDS reader, and that reader is the thing we
+        actually need to rebuild.
+        """
+        for attr in ("_info_sub", "_depth_sub", "_color_sub"):
+            sub = getattr(self, attr, None)
+            if sub is not None:
+                self.destroy_subscription(sub)
         self._info_sub = self.create_subscription(
             CameraInfo, self.info_topic, self._on_info, _sensor_qos(depth=5)
         )
@@ -204,16 +249,108 @@ class PoseEstimatorNode(Node):
             Image, self.color_topic, self._on_color, _sensor_qos(depth=10)
         )
 
-        # Heartbeat on a real timer (independent of color callback firing).
-        # If this keeps ticking while _on_color stops, we know detect() hung.
-        self._heartbeat_timer = self.create_timer(1.0, self._heartbeat)
+    def _watchdog(self) -> None:
+        """Detect a silent subscription death and rebuild the readers.
 
-        self.get_logger().info(
-            f"pose_estimator up; color={self.color_topic} depth={self.depth_topic} "
-            f"info={self.info_topic} frame={self.output_frame}"
+        Two cases are handled:
+
+        1. We *had* been receiving color frames (``_color_seen``) and
+           have now been silent for >= 5 s.  Classic mid-run
+           subscription death from a DDS participant churn.
+
+        2. We have *never* received color, but have been receiving depth
+           or camera_info for >= 8 s.  That's a signal that the
+           subscription infrastructure works (other topics on the same
+           writer process are matching), but specifically the color
+           subscription is dead -- or, more often, the realsense
+           publisher's RGB sensor is itself wedged.  Either way the
+           reader-level rebuild is worth a try; if it doesn't help, the
+           escalation message at attempt 4 will tell the user to
+           power-cycle the camera (unplug+replug the D415).
+
+        Has a 5 s cooldown so we don't churn subscriptions when the
+        publisher genuinely went away.
+
+        After ~3 failed rebuilds we know the reader-level fix won't work
+        (the DDS *participant* is poisoned, not just the reader, or the
+        publisher's color stream is itself dead), so we escalate the log
+        level and stop spamming.
+        """
+        now = time.monotonic()
+        node_age = now - self._node_start_t
+        other_topic_alive = (
+            self._cam_info is not None or self._latest_depth is not None
         )
-
-    # ------------------------------------------------------------------ helpers
+        if self._color_seen:
+            if now - self._last_color_enter_t < 5.0:
+                return
+        elif other_topic_alive and node_age >= 8.0:
+            pass  # case 2: never-saw-color but depth/info arrived
+        else:
+            return
+        if now - self._last_resubscribe_t < 5.0:
+            return
+        attempt = self._resubscribe_count + 1
+        case = "color-died-mid-run" if self._color_seen else "color-never-arrived"
+        if attempt <= 3:
+            if case == "color-died-mid-run":
+                self.get_logger().warn(
+                    f"No color frames for "
+                    f"{now - self._last_color_enter_t:.1f}s but topic "
+                    f"should be active -- the DDS reader appears to "
+                    f"have unmatched.  Rebuilding subscriptions "
+                    f"(attempt #{attempt})."
+                )
+            else:
+                self.get_logger().warn(
+                    f"Color never arrived after {node_age:.1f}s, even "
+                    f"though depth/info matched fine -- "
+                    f"realsense's RGB stream is silently wedged OR the "
+                    f"color subscription specifically failed to match.  "
+                    f"Rebuilding subscriptions (attempt #{attempt})."
+                )
+        elif attempt == 4:
+            # First "we give up on the reader-level fix" message -- log
+            # loud once so the user can find it after the fact, then go
+            # quiet to avoid drowning the rest of the log.
+            if case == "color-died-mid-run":
+                self.get_logger().error(
+                    f"Reader-level rebuild has failed "
+                    f"{self._resubscribe_count} times in a row.  Your "
+                    f"DDS *participant* is poisoned, not just the "
+                    f"subscription, and no amount of resubscribing "
+                    f"will help.  Kill this launch and re-run with "
+                    f"`RMW_IMPLEMENTATION=rmw_fastrtps_cpp` prefixed "
+                    f"(or just use ``demo.launch.py``, which now "
+                    f"defaults to it).  This watchdog will keep trying "
+                    f"silently in case your stack eventually recovers, "
+                    f"but don't hold your breath."
+                )
+            else:
+                self.get_logger().error(
+                    f"Color subscription has been silent since "
+                    f"startup ({self._resubscribe_count} rebuilds, "
+                    f"node age {node_age:.1f}s) while depth and "
+                    f"camera_info match cleanly.  This is almost "
+                    f"always a wedged realsense RGB sensor (often left "
+                    f"over from a previous run that died in "
+                    f"`xioctl(VIDIOC_S_FMT)`).  Kill this launch, then "
+                    f"physically unplug+replug the D415 (or run "
+                    f"`pkill -9 -f realsense2_camera_node` to make "
+                    f"sure no stale process is holding the camera), "
+                    f"then relaunch.  This watchdog will keep trying "
+                    f"silently in case the camera comes back on its "
+                    f"own, but it usually won't."
+                )
+        # attempts >= 5 stay silent so we don't drown the log; the
+        # rebuild itself runs every cycle regardless, in case the stack
+        # ever does recover (e.g. a flaky network bouncing back).
+        self._create_subscriptions()
+        self._last_resubscribe_t = now
+        self._resubscribe_count += 1
+        # Reset _last_color_enter_t so the watchdog gives the new readers
+        # the full 5 s cooldown to start firing before tripping again.
+        self._last_color_enter_t = now
 
     def _on_info(self, msg: CameraInfo) -> None:
         if self._cam_info is None:
@@ -261,12 +398,18 @@ class PoseEstimatorNode(Node):
         us exactly when the color callback last fired.
         """
         idle_s = time.monotonic() - self._last_color_enter_t
+        resub_str = (
+            f" resub={self._resubscribe_count}"
+            if self._resubscribe_count
+            else ""
+        )
         self.get_logger().info(
             f"hb: in={self._frames_in} out={self._frames_out} "
             f"infer={self._last_infer_ms:.0f}ms "
             f"idle={idle_s:.1f}s "
             f"(depth={'ok' if self._latest_depth else 'none'}, "
             f"info={'ok' if self._cam_info else 'none'})"
+            f"{resub_str}"
         )
         self._frames_in = 0
         self._frames_out = 0

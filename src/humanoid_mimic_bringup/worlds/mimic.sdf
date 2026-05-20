@@ -13,10 +13,14 @@
             name="gz::sim::systems::SceneBroadcaster"/>
     <plugin filename="gz-sim-user-commands-system"
             name="gz::sim::systems::UserCommands"/>
-    <plugin filename="gz-sim-sensors-system"
-            name="gz::sim::systems::Sensors">
-      <render_engine>ogre2</render_engine>
-    </plugin>
+    <!-- The G1 has no camera/lidar/depth-camera sensors, so the
+         ``gz-sim-sensors-system`` plugin (which would otherwise initialize
+         an Ogre render engine even in headless mode) is intentionally
+         omitted.  Keeping it caused gazebo to deadlock with MediaPipe's
+         EGL context on the N100's shared Intel iGPU: MediaPipe came up
+         first, grabbed Mesa, then gazebo tried to claim Ogre2 on the same
+         iGPU and both processes stalled before producing any output. -->
+    
 
     <light name="sun" type="directional">
       <pose>0 0 10 0 0 0</pose>

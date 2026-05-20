@@ -43,15 +43,22 @@ def generate_launch_description() -> LaunchDescription:
         output="screen",
         prefix=camera_prefix,
         parameters=[{
-            # Hardware-reset the camera at startup.  Without this, killing
-            # a previous demo with Ctrl-C leaves the D415 in a half-open
-            # state on the USB bus; the next launch opens streams, emits
-            # one or two frames, then silently dies with
-            # ``Hardware Notification: Depth stream start failure`` and
-            # ``get_xu(ctrl=1) failed! Last Error: Device or resource busy``.
-            # ``initial_reset:=true`` issues a hard reset that clears that
-            # stale state.  Adds ~2 s to bring-up.
-            "initial_reset": True,
+            # NB: ``initial_reset:=true`` is intentionally *off*.  It was
+            # tempting because it papers over the "Device or resource
+            # busy" wedge from a previous unclean Ctrl-C, but on the D415
+            # the reset is asynchronous -- librealsense issues
+            # ``rs2::device::hardware_reset()`` and returns immediately,
+            # the kernel re-enumerates the device 5-6 s later with a new
+            # ``/dev/videoN`` node, and *that* re-enumeration arrives
+            # in the middle of streaming and kills the sensor with
+            # ``xioctl(VIDIOC_S_FMT) failed, errno=5 Input/output error``.
+            # We saw exactly that pattern in the logs.  Leave the reset
+            # off; if you do hit "Device or resource busy" (rare, only
+            # after a SIGKILL of the previous launch), unplug+replug the
+            # D415 once or run
+            # ``sudo bash -c 'echo -1 > /sys/module/usbcore/parameters/autosuspend'``
+            # to let the kernel recycle the port.
+            "initial_reset": False,
             # Streams
             "enable_color": True,
             "enable_depth": True,
