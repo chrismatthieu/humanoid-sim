@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>g1_description</name>
+  <version>0.1.0</version>
+  <description>
+    Unitree G1 robot description (URDF + meshes) vendored from
+    unitreerobotics/unitree_ros, plus a generator that produces a Gazebo +
+    ros2_control compatible URDF for the upper-body mimic demo.
+  </description>
+  <maintainer email="humanoid-sim@example.com">humanoid-sim</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

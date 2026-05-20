@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>humanoid_retargeter</name>
+  <version>0.1.0</version>
+  <description>
+    Geometric retargeting from human 3D upper-body keypoints to Unitree G1
+    joint position commands.
+  </description>
+  <maintainer email="humanoid-sim@example.com">humanoid-sim</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>humanoid_pose_estimator</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

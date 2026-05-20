@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>humanoid_mimic_bringup</name>
+  <version>0.1.0</version>
+  <description>
+    Launch files, worlds, ros2_control configs and RViz layouts that wire the
+    Unitree G1 description, the MediaPipe pose estimator and the geometric
+    retargeter into a single end-to-end demo.
+  </description>
+  <maintainer email="humanoid-sim@example.com">humanoid-sim</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>g1_description</exec_depend>
+  <exec_depend>humanoid_pose_estimator</exec_depend>
+  <exec_depend>humanoid_retargeter</exec_depend>
+  <exec_depend>realsense2_camera</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>ros_gz_sim</exec_depend>
+  <exec_depend>ros_gz_bridge</exec_depend>
+  <exec_depend>ros_gz_image</exec_depend>
+  <exec_depend>gz_ros2_control</exec_depend>
+  <exec_depend>controller_manager</exec_depend>
+  <exec_depend>joint_state_broadcaster</exec_depend>
+  <exec_depend>forward_command_controller</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

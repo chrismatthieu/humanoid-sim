@@ -1,0 +1,9 @@
+mediapipe>=0.10.14
+# Pin opencv-python below 4.10 so it remains compatible with the numpy-1.x ABI
+# the rest of the ROS Python stack expects (see numpy note below).
+opencv-python>=4.8,<4.10
+# NumPy must stay on 1.x because Ubuntu 24.04 ships system matplotlib and
+# other ROS Python deps compiled against the 1.x ABI.  Newer 2.x wheels will
+# import-break those packages.
+numpy>=1.24,<2.0
+scipy>=1.11

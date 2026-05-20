@@ -1,0 +1,40 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+    - Class: rviz_default_plugins/RobotModel
+      Name: G1
+      Enabled: true
+      Description Topic:
+        Value: /robot_description
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Human keypoints
+      Enabled: true
+      Topic:
+        Value: /human/markers
+    - Class: rviz_default_plugins/Image
+      Name: Pose debug
+      Enabled: true
+      Topic:
+        Value: /human/debug_image
+  Global Options:
+    Fixed Frame: world
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 4
+      Focal Point: {X: 0, Y: 0, Z: 1.0}
+      Pitch: 0.4
+      Yaw: 2.3
+      Name: Current View

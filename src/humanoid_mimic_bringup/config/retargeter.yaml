@@ -1,0 +1,67 @@
+humanoid_retargeter:
+  ros__parameters:
+    # If true, user's right side controls G1's left side (mirror image, feels
+    # natural when watching yourself on screen). If false, copies same-side.
+    mirror: true
+
+    # Exponential filter on output joint commands. 0=instant, 1=no motion.
+    smoothing_alpha: 0.4
+
+    # Rate at which the retargeter publishes joint commands.
+    command_rate_hz: 30.0
+
+    # Min keypoint visibility from MediaPipe (0..1) to use the keypoint.
+    # Lower values follow the human more aggressively but accept noisier poses.
+    keypoint_min_visibility: 0.5
+
+    # Per-joint sign flip table.  Each value is +1 or -1.  The geometric IK
+    # produces angles that match a canonical convention (see geometric_ik.py);
+    # these flips compensate for the actual URDF axis directions of the G1
+    # joints discovered during the tuning pass.
+    joint_signs:
+      waist_yaw_joint: 1.0
+      left_shoulder_pitch_joint: 1.0
+      left_shoulder_roll_joint: 1.0
+      left_shoulder_yaw_joint: 1.0
+      left_elbow_joint: 1.0
+      left_wrist_roll_joint: 1.0
+      left_wrist_pitch_joint: 1.0
+      left_wrist_yaw_joint: 1.0
+      right_shoulder_pitch_joint: 1.0
+      right_shoulder_roll_joint: -1.0
+      right_shoulder_yaw_joint: -1.0
+      right_elbow_joint: 1.0
+      right_wrist_roll_joint: -1.0
+      right_wrist_pitch_joint: 1.0
+      right_wrist_yaw_joint: -1.0
+
+    # Hard clamp per joint (rad). These match the URDF <limit/> tags so the
+    # controller never sees out-of-bounds commands.
+    joint_limits:
+      waist_yaw_joint:               {min: -2.618, max:  2.618}
+      left_shoulder_pitch_joint:     {min: -3.089, max:  2.670}
+      left_shoulder_roll_joint:      {min: -1.588, max:  2.252}
+      left_shoulder_yaw_joint:       {min: -2.618, max:  2.618}
+      left_elbow_joint:              {min: -1.047, max:  2.094}
+      left_wrist_roll_joint:         {min: -1.972, max:  1.972}
+      left_wrist_pitch_joint:        {min: -1.614, max:  1.614}
+      left_wrist_yaw_joint:          {min: -1.614, max:  1.614}
+      right_shoulder_pitch_joint:    {min: -3.089, max:  2.670}
+      right_shoulder_roll_joint:     {min: -2.252, max:  1.588}
+      right_shoulder_yaw_joint:      {min: -2.618, max:  2.618}
+      right_elbow_joint:             {min: -1.047, max:  2.094}
+      right_wrist_roll_joint:        {min: -1.972, max:  1.972}
+      right_wrist_pitch_joint:       {min: -1.614, max:  1.614}
+      right_wrist_yaw_joint:         {min: -1.614, max:  1.614}
+
+humanoid_pose_estimator:
+  ros__parameters:
+    color_topic: /camera/camera/color/image_raw
+    depth_topic: /camera/camera/aligned_depth_to_color/image_raw
+    info_topic:  /camera/camera/aligned_depth_to_color/camera_info
+    output_frame: camera_color_optical_frame
+    min_confidence: 0.5
+    depth_patch: 5         # half-window in pixels for median depth lookup
+    model_complexity: 0    # 0=lite (fast on CPU), 1=full, 2=heavy
+    publish_debug_image: true
+    publish_markers: true
