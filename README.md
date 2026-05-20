@@ -81,12 +81,49 @@ controller and retargeter configuration.
 3. Move slowly the first few seconds; the smoothing filter takes a moment to
    settle.
 
-### Tuning joint signs / limits live
+### How a commanded angle is computed
 
-The retargeter has a `set_parameter` callback registered, so every entry under
-``joint_signs.*``, ``joint_limits.*``, plus ``mirror`` / ``smoothing_alpha`` /
-``keypoint_min_visibility`` / ``head_to_waist_gain`` / ``head_yaw_sign`` /
-``debug_log_period_s``, can be changed at runtime without restarting the demo:
+For each joint, every tick the retargeter does:
+
+```
+cmd  =  sign * raw_ik  +  offset      # absorb URDF zero-pose mismatch
+cmd  =  clamp(cmd, joint_limits.min, joint_limits.max)
+cmd  =  (1 - alpha) * cmd + alpha * previous_cmd   # exponential smoothing
+```
+
+The `joint_offsets` map was added because the G1's URDF zero pose is *not*
+"straight arm down": at `elbow_joint=0` the forearm extends forward (+x in
+elbow_link), not parallel to the upper arm.  Geometrically the IK assumes a
+clean "arm fully extended" zero, so the elbow needs `sign=-1` and
+`offset=+pi/2` to map the operator's straight-arm rest onto the G1's
+forearm-down pose.  Every other joint defaults to `offset=0`; tune via the
+YAML or `ros2 param set` if you discover similar zero-pose mismatches.
+
+### Tuning joint signs / offsets / limits live
+
+The retargeter has a `set_parameter` callback registered, so every entry
+under ``joint_signs.*``, ``joint_offsets.*``, ``joint_limits.*``, plus
+``mirror`` / ``smoothing_alpha`` / ``keypoint_min_visibility`` /
+``head_to_waist_gain`` / ``head_yaw_sign`` / ``debug_log_period_s``, can be
+changed at runtime without restarting the demo.
+
+> **IMPORTANT - DDS implementation must match the launch.**  ``demo.launch.py``
+> exports ``RMW_IMPLEMENTATION=rmw_fastrtps_cpp`` *for the processes it
+> spawns*, to work around Cyclone DDS' subscription-poisoning bug on this
+> workspace's bring-up profile.  That env var does NOT propagate to other
+> terminals.  If you open a second terminal to ``ros2 param set`` or
+> ``ros2 topic echo``, you must also set this in that terminal:
+>
+> ```bash
+> export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+> ros2 param set /humanoid_retargeter joint_offsets.left_elbow_joint 1.5708
+> ```
+>
+> Without the export, the second terminal will use Jazzy's system default
+> (Cyclone DDS), and any ``ros2`` CLI call will silently hang / time out:
+> the values you "set" are never delivered to the running node, and the
+> debug log never turns on.  When the param set DOES reach the node, the
+> launch console prints a ``param set: name=value`` confirmation line.
 
 ```bash
 # Example: try the *opposite* sign on left_shoulder_roll while the robot is
@@ -128,30 +165,36 @@ Each chirality-flipping joint (anything with ``roll`` or ``yaw`` in the name,
 on either side) must have **opposite** signs on L vs R under ``mirror=true``.
 Pitch / elbow are symmetric and should be the same sign on both sides.
 
-### "One elbow looks upside-down"
+### "The elbows look wrong" / "the hands are turned the opposite way"
 
-Both `left_elbow_joint` and `right_elbow_joint` have **identical** URDF axes
-(`<axis xyz="0 1 0"/>`) and identical limits, and the IK output for elbow is
-the bend magnitude `acos(u·f) ∈ [0, π]` -- it's always non-negative.  So if
-one elbow visually looks "upside-down" while the other looks fine, the elbow
-sign is almost certainly **not** the problem.  What usually causes that
-appearance is the **shoulder_yaw on the same side being off**, which twists
-the upper arm so the elbow's bending plane points the wrong way (the elbow
-*is* bending correctly, but its bending plane is rotated 180° around the
-upper-arm axis, so the forearm sweeps the wrong direction in space).
+This was the original symptom that motivated `joint_offsets` -- see *How a
+commanded angle is computed* above.  The fix is in `retargeter.yaml`
+(`left_elbow_joint`/`right_elbow_joint` have `sign: -1.0` and `offset:
+1.5708`).  If you still see issues:
 
-To diagnose:
-
-1. Turn on ``debug_log_period_s 1.0`` (above).
-2. Pose your arm straight forward with elbow bent 90° (forearm vertical, hand
-   up by your face).  In mirror mode the robot's *opposite* arm should match.
-3. Read the log line.  The elbow you're testing should be near +90°.  If it
-   *is* near +90°, the elbow itself is fine; the misalignment is in
-   ``shoulder_yaw`` on that side.  Try flipping that sign:
-   ```bash
-   ros2 param set /humanoid_retargeter joint_signs.right_shoulder_yaw_joint +1.0
+1. Turn on ``debug_log_period_s 1.0``.
+2. Pose deliberately and read the line:
    ```
-   (or `-1.0`, swapping the current default).
+   cmd(deg): wy=+12.3 | LSp=... LE=+45.0 | RSp=... RE=+44.8
+   ```
+3. Holding your arm straight forward with elbow bent 90° (forearm
+   horizontal, palm facing the floor) should show `LE` (or `RE`) near 0°,
+   because the G1's elbow=0 *is* forearm-forward.  Holding your arm
+   straight down should show `LE`/`RE` near +90°, because the G1 needs
+   to rotate the forearm 90° from rest-forward to point down.
+4. If the relationship is inverted, flip the relevant elbow sign:
+   ```bash
+   ros2 param set /humanoid_retargeter joint_signs.right_elbow_joint +1.0
+   # AND adjust the offset accordingly:
+   ros2 param set /humanoid_retargeter joint_offsets.right_elbow_joint 0.0
+   ```
+
+For *forearm twist* / hand direction (not bend), the culprit is
+``shoulder_yaw`` instead.  Try toggling that sign per side:
+
+```bash
+ros2 param set /humanoid_retargeter joint_signs.right_shoulder_yaw_joint +1.0
+```
 
 ### Head tracking
 

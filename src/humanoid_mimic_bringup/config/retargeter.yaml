@@ -28,6 +28,12 @@ humanoid_retargeter:
     # the robot turns its body to the opposite side of where you look.
     head_yaw_sign: 1.0
 
+    # Dump the commanded joint angles (degrees) every N seconds.  Default
+    # 2.0 keeps it on so calibration mismatches are obvious from the
+    # launch console (look for ``cmd(deg):`` lines).  Set to 0 to silence
+    # once you're happy with the tuning.
+    debug_log_period_s: 2.0
+
     # Per-joint sign flip table.  Each value is +1 or -1.  The geometric IK
     # produces angles that match a canonical convention (see geometric_ik.py);
     # these flips compensate for the actual URDF axis directions of the G1
@@ -48,17 +54,46 @@ humanoid_retargeter:
       # mirror image of the -1.0 on right_shoulder_roll_joint below.
       left_shoulder_roll_joint: -1.0
       left_shoulder_yaw_joint: 1.0
-      left_elbow_joint: 1.0
+      # Elbow needs both a sign flip AND an offset (see joint_offsets
+      # below).  The G1's URDF has the forearm extending forward (+x in
+      # elbow_link) at elbow_joint=0, while the IK's geometric zero is
+      # "fully straight arm".  These differ by pi/2 of elbow rotation
+      # in the opposite direction, hence sign=-1 and offset=+pi/2.
+      left_elbow_joint: -1.0
       left_wrist_roll_joint: 1.0
       left_wrist_pitch_joint: 1.0
       left_wrist_yaw_joint: 1.0
       right_shoulder_pitch_joint: 1.0
       right_shoulder_roll_joint: -1.0
       right_shoulder_yaw_joint: -1.0
-      right_elbow_joint: 1.0
+      right_elbow_joint: -1.0
       right_wrist_roll_joint: -1.0
       right_wrist_pitch_joint: 1.0
       right_wrist_yaw_joint: -1.0
+
+    # Per-joint additive offset in radians, applied as
+    #   cmd = sign * raw_ik + offset
+    # *before* clamping to joint_limits.  Use this to absorb mismatches
+    # between the IK's geometric zero pose and the URDF's joint-zero pose
+    # (e.g. the G1 has the forearm forward at elbow=0, not straight, so
+    # we add pi/2 to map the operator's "straight arm" to G1's
+    # "forearm-down" pose).
+    joint_offsets:
+      waist_yaw_joint:               0.0
+      left_shoulder_pitch_joint:     0.0
+      left_shoulder_roll_joint:      0.0
+      left_shoulder_yaw_joint:       0.0
+      left_elbow_joint:              1.5708   # +pi/2; see joint_signs comment
+      left_wrist_roll_joint:         0.0
+      left_wrist_pitch_joint:        0.0
+      left_wrist_yaw_joint:          0.0
+      right_shoulder_pitch_joint:    0.0
+      right_shoulder_roll_joint:     0.0
+      right_shoulder_yaw_joint:      0.0
+      right_elbow_joint:             1.5708   # +pi/2
+      right_wrist_roll_joint:        0.0
+      right_wrist_pitch_joint:       0.0
+      right_wrist_yaw_joint:         0.0
 
     # Hard clamp per joint (rad). These match the URDF <limit/> tags so the
     # controller never sees out-of-bounds commands.

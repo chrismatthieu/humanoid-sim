@@ -86,15 +86,32 @@ class RetargeterNode(Node):
         #   ros2 param set /humanoid_retargeter debug_log_period_s 1.0
         self.declare_parameter("debug_log_period_s", 0.0)
 
-        # Per-joint sign flips and limits — declared once with defaults, then
-        # overridden by the YAML parameter file.
+        # Per-joint sign flips, offsets, and limits — declared once with
+        # defaults, then overridden by the YAML parameter file.  The
+        # commanded angle is ``sign * raw_ik + offset``, clamped to
+        # ``[min, max]``, then exponentially smoothed.
+        #
+        # ``joint_offsets`` (rad) was added because the G1's kinematic
+        # zero pose does not coincide with the IK's geometric zero pose:
+        # the G1's URDF has the forearm extending forward (along +x in
+        # elbow_link) at elbow_joint=0, but the IK is derived assuming a
+        # "fully straight arm" rest where forearm continues the upper
+        # arm.  These poses differ by ~pi/2 of elbow rotation, so the
+        # elbow needs both a sign flip (-1) and an offset (+pi/2) for
+        # the operator's anatomical rest to map to the G1's anatomical
+        # rest.  Generalising the mechanism to all joints lets us absorb
+        # any future URDF-zero quirks the same way without touching the
+        # IK math.
         self._signs: dict[str, float] = {}
+        self._offsets: dict[str, float] = {}
         self._limits: dict[str, tuple[float, float]] = {}
         for j in CONTROLLER_JOINT_ORDER:
             self.declare_parameter(f"joint_signs.{j}", 1.0)
+            self.declare_parameter(f"joint_offsets.{j}", 0.0)
             self.declare_parameter(f"joint_limits.{j}.min", -3.14)
             self.declare_parameter(f"joint_limits.{j}.max", 3.14)
             self._signs[j] = float(self.get_parameter(f"joint_signs.{j}").value)
+            self._offsets[j] = float(self.get_parameter(f"joint_offsets.{j}").value)
             self._limits[j] = (
                 float(self.get_parameter(f"joint_limits.{j}.min").value),
                 float(self.get_parameter(f"joint_limits.{j}.max").value),
@@ -142,7 +159,14 @@ class RetargeterNode(Node):
         ``joint_signs.left_shoulder_roll_joint:=2.5`` they presumably know
         what they're doing.  We do refuse non-finite values (NaN/Inf) so a
         typo can't poison the smoother.
+
+        Each accepted change is echoed at INFO so the user can verify in
+        the launch console that their ``ros2 param set`` actually reached
+        this node (vs being silently dropped by a DDS-implementation
+        mismatch between the launch and their tuning terminal -- a common
+        failure mode in this workspace, see README).
         """
+        applied: list[str] = []
         for p in params:
             name = p.name
             try:
@@ -155,26 +179,41 @@ class RetargeterNode(Node):
             if name.startswith("joint_signs."):
                 joint = name[len("joint_signs."):]
                 self._signs[joint] = float(value)
+                applied.append(f"{name}={value:+.3f}")
+            elif name.startswith("joint_offsets."):
+                joint = name[len("joint_offsets."):]
+                self._offsets[joint] = float(value)
+                applied.append(f"{name}={value:+.3f}")
             elif name.startswith("joint_limits.") and name.endswith(".min"):
                 joint = name[len("joint_limits."):-len(".min")]
                 lo, hi = self._limits.get(joint, (-3.14, 3.14))
                 self._limits[joint] = (float(value), hi)
+                applied.append(f"{name}={value:+.3f}")
             elif name.startswith("joint_limits.") and name.endswith(".max"):
                 joint = name[len("joint_limits."):-len(".max")]
                 lo, hi = self._limits.get(joint, (-3.14, 3.14))
                 self._limits[joint] = (lo, float(value))
+                applied.append(f"{name}={value:+.3f}")
             elif name == "mirror":
                 self.mirror = bool(value)
+                applied.append(f"mirror={self.mirror}")
             elif name == "smoothing_alpha":
                 self.alpha = float(value)
+                applied.append(f"smoothing_alpha={self.alpha:.3f}")
             elif name == "keypoint_min_visibility":
                 self.min_vis = float(value)
+                applied.append(f"keypoint_min_visibility={self.min_vis:.3f}")
             elif name == "head_to_waist_gain":
                 self.head_to_waist_gain = float(value)
+                applied.append(f"head_to_waist_gain={self.head_to_waist_gain:.3f}")
             elif name == "head_yaw_sign":
                 self.head_yaw_sign = float(value)
+                applied.append(f"head_yaw_sign={self.head_yaw_sign:+.1f}")
             elif name == "debug_log_period_s":
                 self.debug_log_period_s = float(value)
+                applied.append(f"debug_log_period_s={self.debug_log_period_s:.2f}")
+        if applied:
+            self.get_logger().info("param set: " + ", ".join(applied))
         return SetParametersResult(successful=True)
 
     # ------------------------------------------------------------------ helpers
@@ -202,7 +241,7 @@ class RetargeterNode(Node):
         return kps, vis
 
     def _apply_one(self, joint: str, raw_angle: float) -> float:
-        a = self._signs.get(joint, 1.0) * raw_angle
+        a = self._signs.get(joint, 1.0) * raw_angle + self._offsets.get(joint, 0.0)
         lo, hi = self._limits.get(joint, (-3.14, 3.14))
         a = float(np.clip(a, lo, hi))
         prev = self._cmd[joint]

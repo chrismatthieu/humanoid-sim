@@ -98,11 +98,24 @@ def _arm_angles(
     out["elbow"] = elbow_angle
 
     # Yaw: undo pitch/roll, then read the forearm's azimuth.
+    #
+    # We chose ``+x`` of the (post-pitch-roll, post-yaw) frame as the
+    # "yaw = 0" reference direction so this convention agrees with the
+    # G1's URDF: at ``shoulder_yaw_joint = 0, elbow_joint = 0``, the G1's
+    # forearm extends along ``+x_elbow_link`` (the ``wrist_roll_joint``
+    # origin in elbow_link is ``(0.100, 0.002, -0.010)``, dominantly
+    # ``+x``).  Before this we used ``atan2(-y, -x)`` which corresponded
+    # to a "yaw=0 means forearm in -x" convention; that's the +/- pi
+    # mirror of the URDF and the IK was saturating ``shoulder_yaw`` at
+    # the URDF limit of +/- 2.618 rad in every common pose, producing
+    # the "hands turned the opposite direction" symptom (the forearm was
+    # being rotated ~180 deg about the upper-arm axis relative to
+    # what the operator was doing).
     R_pr = _rot_y(pitch) @ _rot_x(roll)
     f_in_yaw_frame = R_pr.T @ f_b
     sin_el = math.sin(elbow_angle)
     if sin_el > 0.08:  # ~5deg; below this, yaw is ill-defined
-        yaw = math.atan2(-f_in_yaw_frame[1], -f_in_yaw_frame[0])
+        yaw = math.atan2(f_in_yaw_frame[1], f_in_yaw_frame[0])
     else:
         yaw = 0.0
     out["shoulder_yaw"] = yaw

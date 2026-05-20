@@ -112,3 +112,56 @@ def test_retargeter_publishes_commands_on_keypoint_input(ros_context):
         retargeter.destroy_node()
         sink.destroy_node()
         publisher_node.destroy_node()
+
+
+def test_apply_one_uses_sign_offset_and_clamp(ros_context):
+    """White-box: ``_apply_one`` should compute ``sign*raw + offset`` then
+    clamp to ``[min, max]`` then exponential-smooth.  This is the path the
+    elbow uses to absorb the G1's URDF-zero-vs-IK-zero mismatch.
+    """
+    rt = RetargeterNode()
+    try:
+        # No smoothing so the first-call result is observable directly.
+        rt.alpha = 0.0
+        # Configure left_elbow_joint with the production elbow recipe:
+        # sign=-1, offset=+pi/2, default limits from the URDF.
+        rt._signs["left_elbow_joint"] = -1.0
+        rt._offsets["left_elbow_joint"] = 1.5708
+        rt._limits["left_elbow_joint"] = (-1.0472, 2.0944)
+
+        # Operator at rest: IK elbow = 0 -> cmd = -1*0 + 1.5708 = +pi/2.
+        out = rt._apply_one("left_elbow_joint", 0.0)
+        assert abs(out - 1.5708) < 1e-6
+
+        # Operator forearm horizontal forward: IK = pi/2 -> cmd = 0.
+        rt._cmd["left_elbow_joint"] = None  # reset the smoother state
+        out = rt._apply_one("left_elbow_joint", 1.5708)
+        assert abs(out) < 1e-6
+
+        # Operator forearm fully folded: IK = pi -> cmd = -pi/2 -> clamps to -1.0472.
+        rt._cmd["left_elbow_joint"] = None
+        out = rt._apply_one("left_elbow_joint", 3.14159)
+        assert abs(out - (-1.0472)) < 1e-3
+    finally:
+        rt.destroy_node()
+
+
+def test_joint_offset_live_param_update(ros_context):
+    """``ros2 param set /humanoid_retargeter joint_offsets.foo 0.5`` should
+    update ``self._offsets`` immediately via the on_set_parameters callback.
+    """
+    from rclpy.parameter import Parameter
+
+    rt = RetargeterNode()
+    try:
+        # Pick a joint we know was declared (any controller joint).
+        joint = "left_elbow_joint"
+        before = rt._offsets[joint]
+        new_val = before + 0.42
+        result = rt.set_parameters(
+            [Parameter(f"joint_offsets.{joint}", Parameter.Type.DOUBLE, new_val)]
+        )
+        assert all(r.successful for r in result), [r.reason for r in result]
+        assert abs(rt._offsets[joint] - new_val) < 1e-9
+    finally:
+        rt.destroy_node()
