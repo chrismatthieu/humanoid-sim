@@ -81,6 +81,43 @@ controller and retargeter configuration.
 3. Move slowly the first few seconds; the smoothing filter takes a moment to
    settle.
 
+### Tuning joint signs / limits live
+
+The retargeter has a `set_parameter` callback registered, so every entry under
+``joint_signs.*``, ``joint_limits.*``, plus ``mirror`` / ``smoothing_alpha`` /
+``keypoint_min_visibility``, can be changed at runtime without restarting the
+demo:
+
+```bash
+# Example: try the *opposite* sign on left_shoulder_roll while the robot is
+# running, e.g. because one arm is crossing the body.
+ros2 param set /humanoid_retargeter joint_signs.left_shoulder_roll_joint -1.0
+
+# Or temporarily disable mirror mode to see same-side mimicry:
+ros2 param set /humanoid_retargeter mirror false
+```
+
+Recommended calibration workflow once the demo is up:
+
+1. Stand still in the neutral pose (arms hanging at sides).  The robot should
+   also be in its neutral pose.  If a joint is far off in neutral, its sign
+   or limit centre is wrong, not the IK.
+2. Raise each arm straight out to the side (T-pose).  The robot's matching
+   arm should also T-pose outward.  If it crosses the body instead, flip the
+   sign on that arm's ``shoulder_roll_joint``.
+3. Reach each arm straight forward.  The robot's arm should reach forward
+   too.  If it reaches backward, flip the sign on that arm's
+   ``shoulder_pitch_joint``.
+4. Touch each shoulder with the same-side hand (full elbow flex).  Robot
+   elbow should bend the same amount.  Wrong sign → elbow extends backward
+   (which the URDF limit clamps to 0).
+5. With arms straight out, twist the upper arm so the palm faces up vs down.
+   That's ``shoulder_yaw``; if rotation looks reversed, flip that sign.
+
+Each chirality-flipping joint (anything with ``roll`` or ``yaw`` in the name,
+on either side) must have **opposite** signs on L vs R under ``mirror=true``.
+Pitch / elbow are symmetric and should be the same sign on both sides.
+
 ## Testing
 
 Unit + integration tests for the geometric IK and the retargeter node:

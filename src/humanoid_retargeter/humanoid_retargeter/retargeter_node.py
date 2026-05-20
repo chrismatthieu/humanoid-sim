@@ -21,7 +21,9 @@ from typing import Optional
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseArray
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from std_msgs.msg import Float64MultiArray
 
 from humanoid_pose_estimator.keypoints import KEYPOINT_COUNT
@@ -89,10 +91,54 @@ class RetargeterNode(Node):
         self.pub = self.create_publisher(Float64MultiArray, cmd_topic, 10)
         self.timer = self.create_timer(1.0 / self.rate_hz, self._tick)
 
+        # Register a param callback so signs / limits / mirror / smoothing can
+        # be live-tuned via ``ros2 param set``.  Calibrating shoulder/wrist
+        # sign flips is iterative -- having to restart the demo every time you
+        # want to test ``left_shoulder_roll_joint: -1.0`` vs ``+1.0`` is
+        # painful (gazebo+camera bring-up alone is ~30s), so we expose every
+        # knob the node owns instead.
+        self.add_on_set_parameters_callback(self._on_param_set)
+
         self.get_logger().info(
             f"retargeter up; mirror={self.mirror} alpha={self.alpha} "
             f"rate={self.rate_hz} Hz, sub={kps_topic} pub={cmd_topic}"
         )
+
+    def _on_param_set(self, params: list[Parameter]) -> SetParametersResult:
+        """Re-pull self._signs/self._limits/self.mirror/etc from ROS params.
+
+        We don't validate aggressively -- if a user types
+        ``joint_signs.left_shoulder_roll_joint:=2.5`` they presumably know
+        what they're doing.  We do refuse non-finite values (NaN/Inf) so a
+        typo can't poison the smoother.
+        """
+        for p in params:
+            name = p.name
+            try:
+                value = p.value
+            except Exception:
+                return SetParametersResult(successful=False, reason=f"bad value for {name}")
+            if isinstance(value, float) and not np.isfinite(value):
+                return SetParametersResult(successful=False, reason=f"non-finite {name}")
+
+            if name.startswith("joint_signs."):
+                joint = name[len("joint_signs."):]
+                self._signs[joint] = float(value)
+            elif name.startswith("joint_limits.") and name.endswith(".min"):
+                joint = name[len("joint_limits."):-len(".min")]
+                lo, hi = self._limits.get(joint, (-3.14, 3.14))
+                self._limits[joint] = (float(value), hi)
+            elif name.startswith("joint_limits.") and name.endswith(".max"):
+                joint = name[len("joint_limits."):-len(".max")]
+                lo, hi = self._limits.get(joint, (-3.14, 3.14))
+                self._limits[joint] = (lo, float(value))
+            elif name == "mirror":
+                self.mirror = bool(value)
+            elif name == "smoothing_alpha":
+                self.alpha = float(value)
+            elif name == "keypoint_min_visibility":
+                self.min_vis = float(value)
+        return SetParametersResult(successful=True)
 
     # ------------------------------------------------------------------ helpers
 

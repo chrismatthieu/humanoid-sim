@@ -21,7 +21,18 @@ humanoid_retargeter:
     joint_signs:
       waist_yaw_joint: 1.0
       left_shoulder_pitch_joint: 1.0
-      left_shoulder_roll_joint: 1.0
+      # left_shoulder_roll is a chirality-flipping axis under mirror=true.
+      # The G1's URDF has both shoulder_roll axes as <axis xyz="1 0 0"/> but
+      # the anatomical "outward" direction is +rad on the left and -rad on
+      # the right (see joint_limits below: left's max=2.252 reserves room
+      # for the +outward side, right's min=-2.252 reserves room for the
+      # -outward side).  With mirror=true, IK feeds the operator's *right*
+      # arm into the G1's left joints, and the operator's right arm raised
+      # outward produces a *negative* IK roll (because operator-right is
+      # -y in the shoulder frame).  We need to flip that to positive to
+      # actually drive the G1's left arm outward -- hence -1.0 here, the
+      # mirror image of the -1.0 on right_shoulder_roll_joint below.
+      left_shoulder_roll_joint: -1.0
       left_shoulder_yaw_joint: 1.0
       left_elbow_joint: 1.0
       left_wrist_roll_joint: 1.0
