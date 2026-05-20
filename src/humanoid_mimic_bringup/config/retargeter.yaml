@@ -14,6 +14,20 @@ humanoid_retargeter:
     # Lower values follow the human more aggressively but accept noisier poses.
     keypoint_min_visibility: 0.5
 
+    # The G1's URDF has head_joint type=fixed -- the head is rigidly bolted
+    # to the torso, no neck joint.  To make the robot's head visually
+    # follow the operator's head, we route head yaw into waist_yaw.
+    #   0.0 = waist follows torso-twist only (original behaviour, robot's
+    #         head stays facing forward when you just turn your head)
+    #   1.0 = waist follows head yaw 1:1 (robot's body turns whenever you
+    #         turn your head; torso-twist contribution suppressed)
+    #   0.7 = head dominates, torso-twist mixes in (default; usually feels
+    #         natural in a mirror demo)
+    head_to_waist_gain: 0.7
+    # Direction of the head_yaw -> waist_yaw mapping.  Flip to -1.0 if
+    # the robot turns its body to the opposite side of where you look.
+    head_yaw_sign: 1.0
+
     # Per-joint sign flip table.  Each value is +1 or -1.  The geometric IK
     # produces angles that match a canonical convention (see geometric_ik.py);
     # these flips compensate for the actual URDF axis directions of the G1

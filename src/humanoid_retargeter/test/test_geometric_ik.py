@@ -15,6 +15,7 @@ import pytest
 from humanoid_pose_estimator.keypoints import KEYPOINT_COUNT, Kp
 from humanoid_retargeter.geometric_ik import (
     IKResult,
+    compute_head_yaw,
     compute_joint_angles,
     swap_left_right_joints,
 )
@@ -231,3 +232,87 @@ def test_mirror_routes_operator_left_arm_to_robot_right():
             tol_deg=0.01)
     # The other side mirrors the operator's resting right arm (~0).
     _approx(swapped["left_shoulder_pitch_joint"], 0.0, tol_deg=2.0)
+
+
+# ---------- head yaw ----------
+
+def _add_ears(kps: np.ndarray, *, head_yaw_deg: float = 0.0) -> None:
+    """Place LEFT_EAR / RIGHT_EAR around the nose, rotated by head_yaw_deg.
+
+    Convention (matching ``compute_head_yaw``):
+
+    - Operator stands at z=+2 in camera optical frame, facing the camera
+      (face direction = -z_cam).  Operator's left side is at +x_cam.
+    - ``head_yaw_deg > 0`` means the operator turned their face to their
+      own *left* (= +x_cam direction).  At +90°, the operator's left ear
+      sits behind them, at +z_cam relative to the nose.
+
+    This is a right-hand rotation about world-up (which in the camera
+    frame is -y_cam, since camera +y is down).
+    """
+    nose = kps[int(Kp.NOSE)]
+    a = math.radians(head_yaw_deg)
+    c, s = math.cos(a), math.sin(a)
+    # R for rotation about world-up = -y_cam by +a.  Mapping:
+    #   (+1, 0,  0) ->  (+c, 0, +s)    (LEFT ear at zero yaw, sweeps back)
+    #   ( 0, 0, +1) ->  (-s, 0, +c)
+    R = np.array([[c, 0, -s], [0, 1, 0], [s, 0, c]])
+    ear_offset = 0.07
+    left_local = np.array([+ear_offset, -0.02, 0.0])
+    right_local = np.array([-ear_offset, -0.02, 0.0])
+    kps[int(Kp.LEFT_EAR)] = nose + R @ left_local
+    kps[int(Kp.RIGHT_EAR)] = nose + R @ right_local
+
+
+def test_head_yaw_zero_when_face_square_to_camera():
+    kps, vis = _build_pose()
+    _add_ears(kps, head_yaw_deg=0.0)
+    vis[int(Kp.LEFT_EAR)] = 1.0
+    vis[int(Kp.RIGHT_EAR)] = 1.0
+    y = compute_head_yaw(kps, vis)
+    assert y is not None
+    assert abs(math.degrees(y)) < 1.0
+
+
+@pytest.mark.parametrize("yaw_deg", [-40.0, -15.0, 15.0, 40.0])
+def test_head_yaw_tracks_head_rotation(yaw_deg: float):
+    kps, vis = _build_pose()
+    _add_ears(kps, head_yaw_deg=yaw_deg)
+    vis[int(Kp.LEFT_EAR)] = 1.0
+    vis[int(Kp.RIGHT_EAR)] = 1.0
+    y = compute_head_yaw(kps, vis)
+    assert y is not None
+    # Signed angle of ear-line about world-up should match head_yaw_deg.
+    # Sign convention: positive head_yaw_deg rotates LEFT ear toward -z_cam
+    # (forward into the camera), which corresponds to *positive* signed
+    # angle of (ear_left - ear_right) about (-y_cam).
+    _approx(y, yaw_deg, tol_deg=1.0)
+
+
+def test_head_yaw_returns_none_when_ear_missing():
+    kps, vis = _build_pose()
+    _add_ears(kps)
+    vis[int(Kp.LEFT_EAR)] = 1.0
+    vis[int(Kp.RIGHT_EAR)] = 0.0  # below min_vis
+    assert compute_head_yaw(kps, vis) is None
+
+
+def test_head_yaw_returns_none_in_profile():
+    """When the operator is in pure profile (one ear behind the head), the
+    projected ear-line collapses and the function should bail out rather
+    than returning a noisy atan2 value.
+    """
+    kps, vis = _build_pose()
+    # 90-degree rotation places both ears on the camera's z axis (i.e.
+    # the ear-line is along -z, with x-projection ~0).  We expect the
+    # function to refuse: cross(s, e) has nearly the full magnitude but
+    # the *projected* ear vector is too short.
+    _add_ears(kps, head_yaw_deg=90.0)
+    vis[int(Kp.LEFT_EAR)] = 1.0
+    vis[int(Kp.RIGHT_EAR)] = 1.0
+    # Pure 90deg is actually fine -- ear_proj has full magnitude.  Build
+    # a degenerate case by shrinking ear_offset until the projection is
+    # tiny.  Easier: override ears manually with near-coincident points.
+    kps[int(Kp.LEFT_EAR)] = kps[int(Kp.NOSE)] + np.array([0.0, -0.02, +0.01])
+    kps[int(Kp.RIGHT_EAR)] = kps[int(Kp.NOSE)] + np.array([0.0, -0.02, -0.01])
+    assert compute_head_yaw(kps, vis) is None

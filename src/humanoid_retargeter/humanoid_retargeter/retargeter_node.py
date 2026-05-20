@@ -16,6 +16,8 @@ command is republished unchanged.
 
 from __future__ import annotations
 
+import math
+import time
 from typing import Optional
 
 import numpy as np
@@ -27,7 +29,11 @@ from rclpy.parameter import Parameter
 from std_msgs.msg import Float64MultiArray
 
 from humanoid_pose_estimator.keypoints import KEYPOINT_COUNT
-from .geometric_ik import compute_joint_angles, swap_left_right_joints
+from .geometric_ik import (
+    compute_head_yaw,
+    compute_joint_angles,
+    swap_left_right_joints,
+)
 
 CONTROLLER_JOINT_ORDER: list[str] = [
     "waist_yaw_joint",
@@ -58,6 +64,27 @@ class RetargeterNode(Node):
         self.declare_parameter("keypoint_min_visibility", 0.5)
         self.declare_parameter("keypoints_topic", "/human/keypoints")
         self.declare_parameter("command_topic", "/upper_body_controller/commands")
+        # Fraction of the operator's head yaw to add into waist_yaw.  The
+        # G1's URDF has no neck joint, so the only way for the robot's
+        # head to follow the operator's head is to spin the whole torso.
+        # 0.0 = ignore head yaw entirely (torso-twist-only, original
+        # behaviour).  1.0 = waist follows head 1:1 (the robot's body
+        # turns whenever you turn your head).  Default 0.7 keeps both
+        # signals: head dominates, but torso-twist still adds in.
+        self.declare_parameter("head_to_waist_gain", 0.7)
+        # Sign flip for the head_yaw signal (camera mirror, operator
+        # facing).  Positive head_yaw from compute_head_yaw means the
+        # operator's left ear moved forward relative to their shoulders,
+        # i.e. they turned their face *to their right*.  With mirror=true
+        # we want the robot to turn *to its left* (operator's right side
+        # of view), and waist_yaw on the G1 increases CCW about +z, which
+        # is the robot's-left direction -- so +1.0 is the natural default.
+        self.declare_parameter("head_yaw_sign", 1.0)
+        # If >0, dump the commanded joint angles (post-sign, post-clamp,
+        # post-smoothing) at this period in seconds.  Off by default;
+        # turn on for IK debugging.  Example:
+        #   ros2 param set /humanoid_retargeter debug_log_period_s 1.0
+        self.declare_parameter("debug_log_period_s", 0.0)
 
         # Per-joint sign flips and limits — declared once with defaults, then
         # overridden by the YAML parameter file.
@@ -78,6 +105,10 @@ class RetargeterNode(Node):
         self.alpha: float = float(gp("smoothing_alpha").value)
         self.min_vis: float = float(gp("keypoint_min_visibility").value)
         self.rate_hz: float = float(gp("command_rate_hz").value)
+        self.head_to_waist_gain: float = float(gp("head_to_waist_gain").value)
+        self.head_yaw_sign: float = float(gp("head_yaw_sign").value)
+        self.debug_log_period_s: float = float(gp("debug_log_period_s").value)
+        self._last_debug_log_t: float = 0.0
         kps_topic: str = gp("keypoints_topic").value
         cmd_topic: str = gp("command_topic").value
 
@@ -138,6 +169,12 @@ class RetargeterNode(Node):
                 self.alpha = float(value)
             elif name == "keypoint_min_visibility":
                 self.min_vis = float(value)
+            elif name == "head_to_waist_gain":
+                self.head_to_waist_gain = float(value)
+            elif name == "head_yaw_sign":
+                self.head_yaw_sign = float(value)
+            elif name == "debug_log_period_s":
+                self.debug_log_period_s = float(value)
         return SetParametersResult(successful=True)
 
     # ------------------------------------------------------------------ helpers
@@ -190,6 +227,21 @@ class RetargeterNode(Node):
         if self.mirror:
             angles = swap_left_right_joints(angles)
 
+        # The G1 URDF has no neck joint, so we mimic head yaw by mixing it
+        # into waist_yaw.  Done *after* swap_left_right_joints because the
+        # waist is not chirality-flipped under mirror mode (it's a
+        # midline joint).  Skipped silently if either ear or either
+        # shoulder is below min_vis, which keeps the prior waist_yaw
+        # value intact rather than snapping to zero.
+        if self.head_to_waist_gain > 0.0:
+            head_yaw = compute_head_yaw(kps, vis, min_vis=self.min_vis)
+            if head_yaw is not None and "waist_yaw_joint" in angles:
+                g = self.head_to_waist_gain
+                angles["waist_yaw_joint"] = (
+                    (1.0 - g) * angles["waist_yaw_joint"]
+                    + g * self.head_yaw_sign * head_yaw
+                )
+
         # Apply each newly computed joint; hold last for the rest.
         for joint, val in angles.items():
             if joint not in self._cmd:
@@ -208,6 +260,28 @@ class RetargeterNode(Node):
             for j in CONTROLLER_JOINT_ORDER
         ]
         self.pub.publish(msg)
+
+        if self.debug_log_period_s > 0.0:
+            now = time.monotonic()
+            if now - self._last_debug_log_t >= self.debug_log_period_s:
+                self._last_debug_log_t = now
+                # Compact one-line dump (degrees, 1 decimal).  Useful for
+                # diagnosing "which joint is wrong" without setting up a
+                # plotter: pose statically, read the line, compare to
+                # what the joint physically *should* be.
+                deg = {j: math.degrees(self._cmd[j] or 0.0) for j in CONTROLLER_JOINT_ORDER}
+                self.get_logger().info(
+                    "cmd(deg): "
+                    f"wy={deg['waist_yaw_joint']:+.1f} | "
+                    f"LSp={deg['left_shoulder_pitch_joint']:+.1f} "
+                    f"LSr={deg['left_shoulder_roll_joint']:+.1f} "
+                    f"LSy={deg['left_shoulder_yaw_joint']:+.1f} "
+                    f"LE={deg['left_elbow_joint']:+.1f} | "
+                    f"RSp={deg['right_shoulder_pitch_joint']:+.1f} "
+                    f"RSr={deg['right_shoulder_roll_joint']:+.1f} "
+                    f"RSy={deg['right_shoulder_yaw_joint']:+.1f} "
+                    f"RE={deg['right_elbow_joint']:+.1f}"
+                )
 
 
 def main(argv: list[str] | None = None) -> None:

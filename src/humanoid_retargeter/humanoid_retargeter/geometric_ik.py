@@ -178,6 +178,66 @@ def compute_joint_angles(
     return IKResult(angles=angles, body_frame_ok=True)
 
 
+def compute_head_yaw(
+    keypoints: np.ndarray,
+    visibility: np.ndarray,
+    *,
+    min_vis: float = 0.5,
+) -> float | None:
+    """Estimate the operator's head yaw in radians.
+
+    The G1's URDF has ``head_joint type="fixed"`` -- the head is rigidly
+    bolted to ``torso_link`` and there is no neck joint to drive.  The only
+    way to make the robot's head visually follow the operator's head turn
+    is to route the operator's head yaw into ``waist_yaw_joint`` (which
+    rotates the whole torso including the head).  The retargeter blends
+    this signal with the torso-twist yaw using the ``head_to_waist_gain``
+    parameter.
+
+    Definition of "head yaw" here: the signed angle (about world up,
+    which is -y in the camera optical frame) from the shoulder-line
+    (``LEFT_SHOULDER - RIGHT_SHOULDER``) to the ear-line
+    (``LEFT_EAR - RIGHT_EAR``), both projected onto the horizontal plane.
+    This is *relative to the torso*, so it captures "turn just your head"
+    rather than "turn your whole body".
+
+    Sign convention: a *positive* return value means the operator turned
+    their face to their own **left** (the ear-line rotated CCW about
+    world up when viewed from above).  This matches the G1's
+    ``waist_yaw_joint`` axis (``<axis xyz="0 0 1"/>``, CCW positive about
+    world up), so under mirror mode you can feed this value directly into
+    waist_yaw without an extra sign flip -- and the robot's head rotates
+    in the *same direction* as the operator's, exactly like a mirror.
+
+    Returns ``None`` if either ear or either shoulder is below ``min_vis``,
+    or if the projected vectors are too short to be reliable (operator
+    looking ~90 deg sideways so both ears collapse).
+    """
+    needed = [Kp.LEFT_EAR, Kp.RIGHT_EAR, Kp.LEFT_SHOULDER, Kp.RIGHT_SHOULDER]
+    if any(visibility[int(k)] < min_vis for k in needed):
+        return None
+
+    world_up_cam = np.array([0.0, -1.0, 0.0])
+
+    ear_left = keypoints[int(Kp.LEFT_EAR)] - keypoints[int(Kp.RIGHT_EAR)]
+    sh_left = keypoints[int(Kp.LEFT_SHOULDER)] - keypoints[int(Kp.RIGHT_SHOULDER)]
+    ear_proj = ear_left - np.dot(ear_left, world_up_cam) * world_up_cam
+    sh_proj = sh_left - np.dot(sh_left, world_up_cam) * world_up_cam
+    if np.linalg.norm(ear_proj) < 0.03 or np.linalg.norm(sh_proj) < 0.03:
+        # ~3 cm projected width: operator is in profile (face perpendicular
+        # to camera) and one ear is occluded behind the head.  Bailing
+        # rather than returning a meaningless atan2 result.
+        return None
+
+    e = _normalize(ear_proj)
+    s = _normalize(sh_proj)
+    # Signed angle from shoulder-line to ear-line about world up (=-y_cam).
+    # cross . up = sin(theta), dot = cos(theta).
+    sin_t = float(np.dot(np.cross(s, e), world_up_cam))
+    cos_t = float(np.dot(s, e))
+    return math.atan2(sin_t, cos_t)
+
+
 def swap_left_right_joints(angles: dict[str, float]) -> dict[str, float]:
     """Swap `left_*` and `right_*` joint names in a joint-angle dict.
 

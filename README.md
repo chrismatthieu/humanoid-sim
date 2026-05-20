@@ -85,8 +85,8 @@ controller and retargeter configuration.
 
 The retargeter has a `set_parameter` callback registered, so every entry under
 ``joint_signs.*``, ``joint_limits.*``, plus ``mirror`` / ``smoothing_alpha`` /
-``keypoint_min_visibility``, can be changed at runtime without restarting the
-demo:
+``keypoint_min_visibility`` / ``head_to_waist_gain`` / ``head_yaw_sign`` /
+``debug_log_period_s``, can be changed at runtime without restarting the demo:
 
 ```bash
 # Example: try the *opposite* sign on left_shoulder_roll while the robot is
@@ -95,6 +95,16 @@ ros2 param set /humanoid_retargeter joint_signs.left_shoulder_roll_joint -1.0
 
 # Or temporarily disable mirror mode to see same-side mimicry:
 ros2 param set /humanoid_retargeter mirror false
+
+# Or turn on the joint-command debug log (degrees, every 1 s).  Pose
+# statically and inspect each joint's commanded angle:
+ros2 param set /humanoid_retargeter debug_log_period_s 1.0
+```
+
+The debug log line looks like:
+
+```
+cmd(deg): wy=+12.3 | LSp=+5.1 LSr=-8.4 LSy=-1.2 LE=+45.0 | RSp=+5.0 RSr=+8.6 RSy=+1.1 RE=+44.8
 ```
 
 Recommended calibration workflow once the demo is up:
@@ -117,6 +127,50 @@ Recommended calibration workflow once the demo is up:
 Each chirality-flipping joint (anything with ``roll`` or ``yaw`` in the name,
 on either side) must have **opposite** signs on L vs R under ``mirror=true``.
 Pitch / elbow are symmetric and should be the same sign on both sides.
+
+### "One elbow looks upside-down"
+
+Both `left_elbow_joint` and `right_elbow_joint` have **identical** URDF axes
+(`<axis xyz="0 1 0"/>`) and identical limits, and the IK output for elbow is
+the bend magnitude `acos(u·f) ∈ [0, π]` -- it's always non-negative.  So if
+one elbow visually looks "upside-down" while the other looks fine, the elbow
+sign is almost certainly **not** the problem.  What usually causes that
+appearance is the **shoulder_yaw on the same side being off**, which twists
+the upper arm so the elbow's bending plane points the wrong way (the elbow
+*is* bending correctly, but its bending plane is rotated 180° around the
+upper-arm axis, so the forearm sweeps the wrong direction in space).
+
+To diagnose:
+
+1. Turn on ``debug_log_period_s 1.0`` (above).
+2. Pose your arm straight forward with elbow bent 90° (forearm vertical, hand
+   up by your face).  In mirror mode the robot's *opposite* arm should match.
+3. Read the log line.  The elbow you're testing should be near +90°.  If it
+   *is* near +90°, the elbow itself is fine; the misalignment is in
+   ``shoulder_yaw`` on that side.  Try flipping that sign:
+   ```bash
+   ros2 param set /humanoid_retargeter joint_signs.right_shoulder_yaw_joint +1.0
+   ```
+   (or `-1.0`, swapping the current default).
+
+### Head tracking
+
+The G1 URDF in this workspace (``g1_29dof_lock_waist.urdf``) has
+``head_joint type="fixed"`` -- the head is rigidly bolted to ``torso_link``,
+so there is no neck joint to drive directly.  To make the robot's head
+follow yours, we route the operator's head yaw (computed from the ear-line
+relative to the shoulder-line, both projected horizontal) into
+``waist_yaw_joint``.  The blend is controlled by:
+
+| parameter            | default | meaning                                                                   |
+| -------------------- | ------- | ------------------------------------------------------------------------- |
+| ``head_to_waist_gain`` | ``0.7``   | 0 = waist follows torso-twist only; 1 = waist follows head 1:1.           |
+| ``head_yaw_sign``      | ``+1.0``  | flip to ``-1.0`` if the robot turns its body to the *opposite* side from where you look. |
+
+If the robot ignores your head turn entirely, check that both ears are above
+``keypoint_min_visibility`` -- in profile (one ear behind the head),
+``compute_head_yaw`` deliberately returns ``None`` and the waist holds its
+last value.
 
 ## Testing
 
@@ -144,6 +198,11 @@ and verifies it publishes `Float64MultiArray` commands when fed a synthetic
   model on first use.
 - **Wrist joints are commanded to 0**.  MediaPipe Pose alone doesn't give
   reliable hand orientation; commanding the wrists would amount to noise.
+- **No neck joint in the G1 URDF**.  ``head_joint`` is ``type="fixed"``, so
+  head mimicking is faked by routing the operator's head yaw into
+  ``waist_yaw_joint`` (see *Head tracking* above).  Side effects: the
+  robot's torso twists when you just turn your head, and head pitch/roll
+  can't be mimicked at all.
 - **Shoulder-roll ±90° is a singularity** in the closed-form IK; the
   smoothing alpha hides most of it, and visually the arm still reaches the
   right place.

@@ -8,6 +8,7 @@ from __future__ import annotations
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
+    ExecuteProcess,
     IncludeLaunchDescription,
     SetEnvironmentVariable,
     TimerAction,
@@ -179,6 +180,60 @@ def generate_launch_description() -> LaunchDescription:
         condition=is_gazebo_first,
     )
 
+    # Auto-launched viewers (gazebo GUI + RViz), gated on ``gui:=true``.
+    #
+    # We deliberately run the gazebo GUI as a *separate* ``gz sim -g`` process
+    # rather than as part of the headed ``gz sim`` server.  When the GUI is in
+    # the same process as the server, it shares the server's Ogre2 context
+    # and the server's CPU affinity (cores 2-3), which on this N100 was
+    # enough to starve the camera/MediaPipe pipeline on cores 0-1 via iGPU
+    # contention.  As an external client the GUI is just another consumer of
+    # the gz transport bus, with its own process boundary, and can be killed
+    # without touching the physics step.
+    #
+    # The delay differs by bringup order: we want to attach the GUI/RViz
+    # *after* every node we'd care to inspect has come up, otherwise RViz
+    # opens with "no fixed frame" errors and the GUI shows an empty world.
+    #   camera_first: camera at t=0, gazebo at t=12.  Viewers at t=22.
+    #   gazebo_first: gazebo at t=0,  camera at t=30. Viewers at t=40.
+    gui = LaunchConfiguration("gui")
+    cf_gui = IfCondition(
+        PythonExpression([
+            "'", bringup_order, "' == 'camera_first' and '", gui, "' == 'true'",
+        ])
+    )
+    gf_gui = IfCondition(
+        PythonExpression([
+            "'", bringup_order, "' == 'gazebo_first' and '", gui, "' == 'true'",
+        ])
+    )
+    rviz_cfg = PathJoinSubstitution([bringup, "rviz", "demo.rviz"])
+
+    def _viewers(condition):
+        # ``gz sim -g`` attaches to the running headless server; ``rviz2``
+        # opens the demo config.  Both are pinned to cores 2-3 so they
+        # share the cycles already reserved for gazebo and stay off of the
+        # camera/pose cores 0-1.
+        return [
+            ExecuteProcess(
+                cmd=["taskset", "-c", "2,3", "gz", "sim", "-g"],
+                output="screen",
+                condition=condition,
+            ),
+            Node(
+                package="rviz2",
+                executable="rviz2",
+                name="rviz2",
+                arguments=["-d", rviz_cfg],
+                output="screen",
+                prefix="taskset -c 2,3",
+                condition=condition,
+            ),
+        ]
+
+    cf_viewers = TimerAction(period=22.0, actions=_viewers(cf_gui))
+    gf_viewers = TimerAction(period=40.0, actions=_viewers(gf_gui))
+
     return LaunchDescription([
         DeclareLaunchArgument(
             "dds",
@@ -192,14 +247,33 @@ def generate_launch_description() -> LaunchDescription:
             ),
         ),
         rmw_default,
+        # ``use_rviz`` is the *in-process* RViz baked into sim.launch.py.  It
+        # stays off by default because in this demo we launch RViz separately
+        # via the ``gui`` flag below, after a delay, so that it doesn't fight
+        # the camera bring-up for CPU cycles.
         DeclareLaunchArgument("use_rviz", default_value="false"),
         DeclareLaunchArgument(
             "headless",
-            default_value="false",
+            # NB: default is ``true`` here even though sim.launch.py defaults
+            # to ``false``.  When this demo launch is used end-to-end we want
+            # gazebo server-only by default (no Ogre2 inside the gazebo
+            # process) and the GUI auto-attached as an *external* ``gz sim
+            # -g`` client below.  That way the iGPU/Mesa contention with
+            # MediaPipe disappears regardless of the operator's machine.
+            default_value="true",
             description=(
-                "Run gazebo server-only (no GUI).  Removes Ogre2 from the "
-                "iGPU; required if your machine shares Mesa between gazebo "
-                "and MediaPipe."
+                "Run gazebo server-only (no GUI inside the gazebo process).  "
+                "The GUI client is auto-attached separately via ``gui:=true``."
+            ),
+        ),
+        DeclareLaunchArgument(
+            "gui",
+            default_value="true",
+            description=(
+                "Auto-launch the gazebo GUI client and RViz a few seconds "
+                "after the pipeline is up.  Set false for fully headless "
+                "operation (e.g. when SSHing in or running on a remote "
+                "compute box)."
             ),
         ),
         DeclareLaunchArgument(
@@ -221,4 +295,6 @@ def generate_launch_description() -> LaunchDescription:
         gf_sim,
         gf_retargeter,
         gf_camera_delayed,
+        cf_viewers,
+        gf_viewers,
     ])
