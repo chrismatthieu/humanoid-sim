@@ -19,6 +19,11 @@
   <exec_depend>cv_bridge</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-opencv</exec_depend>
+  <!-- Used by ``align_mode='manual'`` to read the depth->color rigid
+       transform from the realsense2_camera node.  Optional at runtime
+       (only imported in the manual path) but declaring the dep makes
+       rosdep install it on Jetson where we need it. -->
+  <exec_depend>realsense2_camera_msgs</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

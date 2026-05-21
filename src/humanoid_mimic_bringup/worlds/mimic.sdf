@@ -1,4 +1,15 @@
 <?xml version="1.0"?>
+<!--
+  Cross-Gazebo template world.  ``{{plugin_prefix}}`` and ``{{plugin_ns}}``
+  are substituted at launch time by ``_machine_profile.render_world_sdf``
+  to ``gz-sim`` / ``gz::sim`` on Gazebo Harmonic (Jazzy desktops) or
+  ``ignition-gazebo`` / ``ignition::gazebo`` on Gazebo Fortress (Humble /
+  Jetson).  Keep the rest of the file backend-agnostic.
+
+  This file is NOT consumed directly by ``gz sim`` / ``ign gazebo`` -- it
+  is rendered into ``/tmp/humanoid_sim_world.sdf`` first.  Loading the raw
+  template will fail because the curly braces aren't valid SDF.
+-->
 <sdf version="1.10">
   <world name="mimic">
     <physics name="dt" type="ignored">
@@ -7,20 +18,20 @@
       <real_time_update_rate>250</real_time_update_rate>
     </physics>
 
-    <plugin filename="gz-sim-physics-system"
-            name="gz::sim::systems::Physics"/>
-    <plugin filename="gz-sim-scene-broadcaster-system"
-            name="gz::sim::systems::SceneBroadcaster"/>
-    <plugin filename="gz-sim-user-commands-system"
-            name="gz::sim::systems::UserCommands"/>
+    <plugin filename="{plugin_prefix}-physics-system"
+            name="{plugin_ns}::systems::Physics"/>
+    <plugin filename="{plugin_prefix}-scene-broadcaster-system"
+            name="{plugin_ns}::systems::SceneBroadcaster"/>
+    <plugin filename="{plugin_prefix}-user-commands-system"
+            name="{plugin_ns}::systems::UserCommands"/>
     <!-- The G1 has no camera/lidar/depth-camera sensors, so the
-         ``gz-sim-sensors-system`` plugin (which would otherwise initialize
-         an Ogre render engine even in headless mode) is intentionally
+         ``-sensors-system`` plugin (which would otherwise initialize an
+         Ogre render engine even in headless mode) is intentionally
          omitted.  Keeping it caused gazebo to deadlock with MediaPipe's
          EGL context on the N100's shared Intel iGPU: MediaPipe came up
          first, grabbed Mesa, then gazebo tried to claim Ogre2 on the same
          iGPU and both processes stalled before producing any output. -->
-    
+
 
     <light name="sun" type="directional">
       <pose>0 0 10 0 0 0</pose>

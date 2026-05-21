@@ -1,10 +1,18 @@
-"""ROS 2 node: MediaPipe PoseLandmarker (Tasks API) + RealSense aligned depth
+"""ROS 2 node: MediaPipe PoseLandmarker (Tasks API) + RealSense depth
 => 3D human keypoints.
 
 Subscribes (color triggers inference, depth + info are latest-cached):
   - color image  (sensor_msgs/Image, encoding rgb8 or bgr8)
-  - aligned depth image  (sensor_msgs/Image, 16UC1 in mm or 32FC1 in m)
-  - depth camera_info  (sensor_msgs/CameraInfo, captured once)
+  - depth image  (sensor_msgs/Image, 16UC1 in mm or 32FC1 in m).  Either
+    the realsense-side aligned-depth-to-color stream (default on the
+    Intel N100 / D415 path) or the raw depth-frame stream (default on
+    the Jetson AGX Orin / D457 path -- see ``align_mode`` below).
+  - color or depth camera_info  (sensor_msgs/CameraInfo) -- which one is
+    semantically the "color intrinsics" depends on ``align_mode``; either
+    way it's the K used for back-projecting MediaPipe landmark pixels.
+  - (manual mode only) realsense2_camera_msgs/Extrinsics
+    /camera/.../extrinsics/depth_to_color  and a separate
+    /camera/.../depth/camera_info for the depth-sensor intrinsics.
 
 Publishes:
   - /human/keypoints (geometry_msgs/PoseArray) in the color optical frame.
@@ -15,6 +23,23 @@ Publishes:
 
 Model files (`pose_landmarker_{lite,full,heavy}.task`) are auto-downloaded
 to ~/.cache/humanoid_pose_estimator/models on first use.
+
+``align_mode`` (default ``realsense``):
+
+  * ``realsense`` -- subscribe to ``aligned_depth_to_color/image_raw`` and
+    look up depth at the color pixel directly.  Works on any RealSense
+    that exposes UVC frame metadata (the D415 over USB does, and so does
+    the D435/D455 over USB).
+  * ``manual`` -- subscribe to the raw ``depth/image_rect_raw`` plus the
+    ``extrinsics/depth_to_color`` topic and the depth-sensor intrinsics,
+    and warp each landmark from the color pixel into the depth pixel
+    ourselves.  Required on the Jetson AGX Orin with a D457 connected
+    via GMSL2: that hardware path does not expose UVC frame metadata,
+    so librealsense's sync filter cannot pair depth+color frames and the
+    realsense-side aligned-depth pipeline silently produces no messages
+    even though the topic is advertised.  See
+    ``/opt/ros/humble/share/realsense2_camera/examples/align_depth/`` and
+    the README "Jetson AGX Orin" section for the diagnostic.
 """
 
 from __future__ import annotations
@@ -98,6 +123,20 @@ class PoseEstimatorNode(Node):
                                "/camera/camera/aligned_depth_to_color/image_raw")
         self.declare_parameter("info_topic",
                                "/camera/camera/aligned_depth_to_color/camera_info")
+        # ``align_mode``: ``realsense`` uses librealsense's depth->color
+        # align filter (depth is sampled directly at the color pixel);
+        # ``manual`` runs the alignment in this node using the extrinsics
+        # topic.  See the module docstring.  Auto-flipping the defaults
+        # of ``depth_topic`` and ``info_topic`` is deliberate so the user
+        # only has to set ``align_mode:=manual`` to switch the whole
+        # pipeline; explicit topic overrides still win.
+        self.declare_parameter("align_mode", "realsense")
+        self.declare_parameter(
+            "depth_info_topic", "/camera/camera/depth/camera_info"
+        )
+        self.declare_parameter(
+            "extrinsics_topic", "/camera/camera/extrinsics/depth_to_color"
+        )
         self.declare_parameter("output_frame", "camera_color_optical_frame")
         self.declare_parameter("min_confidence", 0.5)
         self.declare_parameter("depth_patch", 5)
@@ -133,6 +172,24 @@ class PoseEstimatorNode(Node):
         self.color_topic: str = gp("color_topic").value
         self.depth_topic: str = gp("depth_topic").value
         self.info_topic: str = gp("info_topic").value
+        self.align_mode: str = str(gp("align_mode").value).strip().lower()
+        if self.align_mode not in ("realsense", "manual"):
+            raise ValueError(
+                f"align_mode must be 'realsense' or 'manual', got {self.align_mode!r}"
+            )
+        # In manual mode swap the defaults to raw streams unless the
+        # operator has overridden them.  ``info_topic`` in manual mode is
+        # the *color* camera_info because that's the K we use for back-
+        # projection downstream.  The depth-sensor K comes from a
+        # separate ``depth_info_topic`` and is only used for the
+        # color-pixel -> depth-pixel warp.
+        if self.align_mode == "manual":
+            if self.depth_topic == "/camera/camera/aligned_depth_to_color/image_raw":
+                self.depth_topic = "/camera/camera/depth/image_rect_raw"
+            if self.info_topic == "/camera/camera/aligned_depth_to_color/camera_info":
+                self.info_topic = "/camera/camera/color/camera_info"
+        self.depth_info_topic: str = gp("depth_info_topic").value
+        self.extrinsics_topic: str = gp("extrinsics_topic").value
         self.output_frame: str = gp("output_frame").value
         self.min_confidence: float = float(gp("min_confidence").value)
         self.depth_patch: int = int(gp("depth_patch").value)
@@ -219,6 +276,28 @@ class PoseEstimatorNode(Node):
         self._info_sub: Optional[Any] = None
         self._depth_sub: Optional[Any] = None
         self._color_sub: Optional[Any] = None
+        # Manual-alignment state (populated only when align_mode=="manual").
+        self._depth_K: Optional[np.ndarray] = None   # 3x3 depth intrinsics
+        self._R_dc: Optional[np.ndarray] = None      # depth->color rotation (3x3)
+        self._t_dc: Optional[np.ndarray] = None      # depth->color translation (3,)
+        self._depth_info_sub: Optional[Any] = None
+        self._extrinsics_sub: Optional[Any] = None
+        # Cache the last good operator distance to seed the
+        # color-pixel->depth-pixel iteration; 2.0 m is a reasonable
+        # initial guess for the demo's calibration setup.
+        self._last_z_guess: float = 2.0
+        # Lazy-load realsense2_camera_msgs only when actually needed -- it
+        # is an optional dependency for the realsense (aligned) path.
+        self._extrinsics_msg_type = None
+        if self.align_mode == "manual":
+            try:
+                from realsense2_camera_msgs.msg import Extrinsics
+                self._extrinsics_msg_type = Extrinsics
+            except ImportError as exc:
+                raise RuntimeError(
+                    "align_mode='manual' requires realsense2_camera_msgs. "
+                    "Install with apt: ros-${ROS_DISTRO}-realsense2-camera-msgs"
+                ) from exc
 
         self.pub_kps = self.create_publisher(PoseArray, "/human/keypoints", 10)
         self.pub_markers = self.create_publisher(MarkerArray, "/human/markers", 10)
@@ -247,9 +326,15 @@ class PoseEstimatorNode(Node):
         # cheap when healthy and self-healing when not.
         self._watchdog_timer = self.create_timer(2.0, self._watchdog)
 
+        extra = ""
+        if self.align_mode == "manual":
+            extra = (
+                f" align=manual depth_info={self.depth_info_topic} "
+                f"extrinsics={self.extrinsics_topic}"
+            )
         self.get_logger().info(
             f"pose_estimator up; color={self.color_topic} depth={self.depth_topic} "
-            f"info={self.info_topic} frame={self.output_frame}"
+            f"info={self.info_topic} frame={self.output_frame}{extra}"
         )
 
     # ------------------------------------------------------------------ helpers
@@ -259,12 +344,20 @@ class PoseEstimatorNode(Node):
 
         Pulled into a helper so the watchdog can rebuild the readers when
         Cyclone DDS drops the subscriber<->writer match during gazebo
-        bring-up.  Destroying the old subscription before recreating is
-        important: ``rclpy``'s subscription objects hold a reference to
+        bring-up.  In manual-align mode we additionally (re)create the
+        depth-sensor camera_info and extrinsics subscriptions, which are
+        latched-style (the publisher sends them once at startup) so
+        rebuilding the reader is important if the original message was
+        sent before the subscriber matched.  Destroying the old
+        subscription before recreating is important: ``rclpy``'s
+        subscription objects hold a reference to
         the underlying DDS reader, and that reader is the thing we
         actually need to rebuild.
         """
-        for attr in ("_info_sub", "_depth_sub", "_color_sub"):
+        for attr in (
+            "_info_sub", "_depth_sub", "_color_sub",
+            "_depth_info_sub", "_extrinsics_sub",
+        ):
             sub = getattr(self, attr, None)
             if sub is not None:
                 self.destroy_subscription(sub)
@@ -277,6 +370,28 @@ class PoseEstimatorNode(Node):
         self._color_sub = self.create_subscription(
             Image, self.color_topic, self._on_color, _sensor_qos(depth=10)
         )
+        if self.align_mode == "manual":
+            self._depth_info_sub = self.create_subscription(
+                CameraInfo,
+                self.depth_info_topic,
+                self._on_depth_info,
+                _sensor_qos(depth=5),
+            )
+            # The extrinsics topic is published once at startup with
+            # TRANSIENT_LOCAL durability on the realsense2_camera side,
+            # so the subscriber must request a compatible (or weaker)
+            # durability to receive the late-joiner replay.
+            self._extrinsics_sub = self.create_subscription(
+                self._extrinsics_msg_type,
+                self.extrinsics_topic,
+                self._on_extrinsics,
+                QoSProfile(
+                    depth=1,
+                    reliability=QoSReliabilityPolicy.RELIABLE,
+                    durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                    history=QoSHistoryPolicy.KEEP_LAST,
+                ),
+            )
 
     def _watchdog(self) -> None:
         """Detect a silent subscription death and rebuild the readers.
@@ -397,6 +512,47 @@ class PoseEstimatorNode(Node):
         with self._depth_lock:
             self._latest_depth = msg
 
+    def _on_depth_info(self, msg: CameraInfo) -> None:
+        """Cache the *depth-sensor* intrinsics for manual alignment.
+
+        Distinct from :py:meth:`_on_info` (which receives the color/aligned
+        intrinsics used for landmark back-projection).  We only consume
+        the K matrix here -- distortion is ignored because the realsense
+        depth stream is already rectified.
+        """
+        if self._depth_K is None:
+            self.get_logger().info(
+                f"depth_info: first message received (K=fx={msg.k[0]:.1f},"
+                f"fy={msg.k[4]:.1f},cx={msg.k[2]:.1f},cy={msg.k[5]:.1f}, "
+                f"size={msg.width}x{msg.height})"
+            )
+        self._depth_K = np.asarray(msg.k, dtype=np.float64).reshape(3, 3)
+
+    def _on_extrinsics(self, msg) -> None:
+        """Cache the depth->color rigid transform for manual alignment.
+
+        ``realsense2_camera_msgs/Extrinsics`` carries a column-major 3x3
+        rotation and a 3-vector translation in metres.  Convention from
+        ``rs2_transform_point_to_point``::
+
+            P_color = R * P_depth + t
+
+        i.e. ``rotation`` and ``translation`` are *from* the depth optical
+        frame *to* the color optical frame.  We store ``R`` row-major
+        (numpy default) by transposing the column-major payload.
+        """
+        # The wire format is a length-9 column-major array.
+        R_colmajor = np.asarray(msg.rotation, dtype=np.float64).reshape(3, 3)
+        R = R_colmajor.T  # column-major -> row-major (i.e. numpy standard)
+        t = np.asarray(msg.translation, dtype=np.float64)
+        if self._R_dc is None:
+            self.get_logger().info(
+                f"extrinsics: depth->color t=({t[0]:+.3f},{t[1]:+.3f},"
+                f"{t[2]:+.3f}) m, R~I+{np.linalg.norm(R - np.eye(3)):.2e}"
+            )
+        self._R_dc = R
+        self._t_dc = t
+
     @staticmethod
     def _depth_to_meters(depth_img: np.ndarray) -> np.ndarray:
         """Convert RealSense 16UC1 (mm) or 32FC1 (m) to meters as float32."""
@@ -418,6 +574,99 @@ class PoseEstimatorNode(Node):
         if valid.size == 0:
             return 0.0
         return float(np.median(valid))
+
+    def _z_for_color_pixel(
+        self,
+        u_color: float,
+        v_color: float,
+        depth_m: np.ndarray,
+        K_color: np.ndarray,
+    ) -> float:
+        """Return the depth (Z, in *color* frame, meters) at a color pixel.
+
+        In ``align_mode='realsense'`` this is a direct median lookup on
+        the already-aligned depth image, identical to the pre-existing
+        behavior of the node (depth-pixel and color-pixel are the same).
+
+        In ``align_mode='manual'`` we don't have an aligned image, so we
+        warp the color pixel onto the depth image using the extrinsics:
+
+          1. Start with a guess ``Z0`` for how far the 3D point is from
+             the camera (seeded from the last successful sample so the
+             iteration converges in 1 step at steady state).
+          2. Back-project (u_color, v_color, Z0) to a 3D point in the
+             color optical frame.
+          3. Apply the *inverse* depth->color extrinsics to express that
+             point in the depth optical frame.
+          4. Project into the depth image with the depth intrinsics.
+          5. Sample depth at that pixel.
+          6. Re-build the true 3D point from the sampled depth + depth
+             intrinsics, and convert back to color frame.  Its Z is the
+             answer; feed it back as ``Z0`` for one refinement pass to
+             handle large-disparity edge cases (operator very close, or
+             landmark near the edge of the color FOV).
+
+        Returns 0.0 if any step fails so callers can treat it identically
+        to ``_median_depth`` returning 0.0 (i.e. ignore the landmark).
+        """
+        if self.align_mode == "realsense":
+            return self._median_depth(
+                depth_m, int(round(u_color)), int(round(v_color))
+            )
+
+        if self._depth_K is None or self._R_dc is None or self._t_dc is None:
+            # Manual mode but extrinsics / depth_info haven't arrived yet.
+            return 0.0
+
+        fxc, fyc, cxc, cyc = K_color[0, 0], K_color[1, 1], K_color[0, 2], K_color[1, 2]
+        fxd, fyd, cxd, cyd = (
+            self._depth_K[0, 0], self._depth_K[1, 1],
+            self._depth_K[0, 2], self._depth_K[1, 2],
+        )
+        R = self._R_dc      # depth -> color
+        t = self._t_dc
+
+        # Ray direction in color frame (unit-Z so Z component scales it).
+        ax = (u_color - cxc) / fxc
+        ay = (v_color - cyc) / fyc
+
+        Z = self._last_z_guess if self._last_z_guess > 0.1 else 2.0
+        final_z = 0.0
+        for _ in range(2):
+            # 3D point at depth Z in color frame.
+            Pc = np.array([ax * Z, ay * Z, Z], dtype=np.float64)
+            # Express in depth frame: P_color = R*P_depth + t  =>
+            # P_depth = R^T (P_color - t).
+            Pd_guess = R.T @ (Pc - t)
+            if Pd_guess[2] < 0.05:
+                return 0.0
+            u_d = fxd * Pd_guess[0] / Pd_guess[2] + cxd
+            v_d = fyd * Pd_guess[1] / Pd_guess[2] + cyd
+            ud_i = int(round(u_d))
+            vd_i = int(round(v_d))
+            Z_d = self._median_depth(depth_m, ud_i, vd_i)
+            if Z_d <= 0.05:
+                # Hole in the depth image at the warped pixel.  Fall back
+                # to looking up at the *color* pixel position directly,
+                # which is at worst a few-cm error on the D457 baseline
+                # but better than dropping the landmark entirely.
+                Z_d = self._median_depth(
+                    depth_m, int(round(u_color)), int(round(v_color))
+                )
+                if Z_d <= 0.05:
+                    return 0.0
+            # True 3D point in depth frame, then convert to color frame.
+            Pd_true = np.array([
+                (ud_i - cxd) / fxd * Z_d,
+                (vd_i - cyd) / fyd * Z_d,
+                Z_d,
+            ], dtype=np.float64)
+            Pc_true = R @ Pd_true + t
+            final_z = float(Pc_true[2])
+            Z = final_z  # refine on next iteration
+        if 0.1 < final_z < 8.0:
+            self._last_z_guess = final_z
+        return final_z
 
     @staticmethod
     def _solve_wrist_depth_for_forearm(
@@ -483,12 +732,18 @@ class PoseEstimatorNode(Node):
                 f" fix(el={self._elbow_fix_count},"
                 f"wr={self._wrist_fix_count})"
             )
+        extra_status = ""
+        if self.align_mode == "manual":
+            extra_status = (
+                f", dK={'ok' if self._depth_K is not None else 'none'}"
+                f", ext={'ok' if self._R_dc is not None else 'none'}"
+            )
         self.get_logger().info(
             f"hb: in={self._frames_in} out={self._frames_out} "
             f"infer={self._last_infer_ms:.0f}ms "
             f"idle={idle_s:.1f}s "
             f"(depth={'ok' if self._latest_depth else 'none'}, "
-            f"info={'ok' if self._cam_info else 'none'})"
+            f"info={'ok' if self._cam_info else 'none'}{extra_status})"
             f"{fixes}"
             f"{resub_str}"
         )
@@ -535,9 +790,10 @@ class PoseEstimatorNode(Node):
         fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
 
         h_color, w_color = color.shape[:2]
-        h_depth, w_depth = depth_m.shape
-        scale_u = w_depth / w_color
-        scale_v = h_depth / h_color
+        # Color-pixel -> depth-pixel mapping happens inside
+        # ``_z_for_color_pixel`` (a direct lookup for the aligned mode,
+        # an extrinsics-based warp for the manual mode), so we don't
+        # need any resolution-scaling factors here.
 
         mp_image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=color)
         t0 = time.monotonic()
@@ -565,9 +821,7 @@ class PoseEstimatorNode(Node):
 
                 u_color = m.x * w_color
                 v_color = m.y * h_color
-                ud = int(round(u_color * scale_u))
-                vd = int(round(v_color * scale_v))
-                z = self._median_depth(depth_m, ud, vd)
+                z = self._z_for_color_pixel(u_color, v_color, depth_m, K)
 
                 pose = out.poses[int(kp_enum)]
                 if z > 0.0 and visibility >= self.min_confidence:

@@ -1,15 +1,20 @@
 """Top-level launch: camera + pose estimator + retargeter + Gazebo + G1.
 
-This is the demo entry point.
+This is the demo entry point.  See ``_machine_profile.py`` for which knobs
+(Gazebo backend, CPU affinity, render engine) are auto-selected per host.
 """
 
 from __future__ import annotations
+
+import importlib.util
+import os
 
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
     IncludeLaunchDescription,
+    LogInfo,
     SetEnvironmentVariable,
     TimerAction,
 )
@@ -22,6 +27,24 @@ from launch.substitutions import (
 )
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
+
+
+def _load_machine_profile():
+    """See sim.launch.py for the rationale on sys.modules registration."""
+    import sys
+    name = "_humanoid_machine_profile"
+    if name in sys.modules:
+        return sys.modules[name]
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location(
+        name, os.path.join(here, "_machine_profile.py"),
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load _machine_profile.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def _sim_launch(bringup):
@@ -47,6 +70,9 @@ def _retargeter(retargeter_yaml):
 
 
 def generate_launch_description() -> LaunchDescription:
+    profile_mod = _load_machine_profile()
+    profile = profile_mod.detect()
+
     bringup = FindPackageShare("humanoid_mimic_bringup")
     retargeter_yaml = PathJoinSubstitution([bringup, "config", "retargeter.yaml"])
 
@@ -109,7 +135,7 @@ def generate_launch_description() -> LaunchDescription:
     # Mitigations layered together:
     #   1. CPU affinity (see ``sim.launch.py`` / ``camera.launch.py``):
     #      pin realsense + pose_estimator to cores 0-1 and gazebo + rviz
-    #      to cores 2-3 via ``taskset``.
+    #      to cores 2-3 via ``taskset``.  Auto-disabled on >=8-core hosts.
     #   2. ``headless:=true`` (server-only gazebo, no Ogre) avoids any
     #      iGPU contention with MediaPipe's EGL context.
     #   3. ``bringup_order:=gazebo_first`` brings the camera up *after*
@@ -188,14 +214,15 @@ def generate_launch_description() -> LaunchDescription:
 
     # Auto-launched viewers (gazebo GUI + RViz), gated on ``gui:=true``.
     #
-    # We deliberately run the gazebo GUI as a *separate* ``gz sim -g`` process
-    # rather than as part of the headed ``gz sim`` server.  When the GUI is in
-    # the same process as the server, it shares the server's Ogre2 context
-    # and the server's CPU affinity (cores 2-3), which on this N100 was
-    # enough to starve the camera/MediaPipe pipeline on cores 0-1 via iGPU
-    # contention.  As an external client the GUI is just another consumer of
-    # the gz transport bus, with its own process boundary, and can be killed
-    # without touching the physics step.
+    # We deliberately run the gazebo GUI as a *separate* process (``gz sim
+    # -g`` on Harmonic, ``ign gazebo -g`` on Fortress) rather than as part
+    # of the headed simulator.  When the GUI is in the same process as the
+    # server, it shares the server's Ogre2 context and the server's CPU
+    # affinity (cores 2-3), which on this N100 was enough to starve the
+    # camera/MediaPipe pipeline on cores 0-1 via iGPU contention.  As an
+    # external client the GUI is just another consumer of the gz transport
+    # bus, with its own process boundary, and can be killed without
+    # touching the physics step.
     #
     # The delay differs by bringup order: we want to attach the GUI/RViz
     # *after* every node we'd care to inspect has come up, otherwise RViz
@@ -215,14 +242,18 @@ def generate_launch_description() -> LaunchDescription:
     )
     rviz_cfg = PathJoinSubstitution([bringup, "rviz", "demo.rviz"])
 
+    aff_prefix_cmd = profile.taskset_cmd(profile.gz_cores)
+    aff_prefix_str = profile.taskset(profile.gz_cores)
+
     def _viewers(condition):
-        # ``gz sim -g`` attaches to the running headless server; ``rviz2``
-        # opens the demo config.  Both are pinned to cores 2-3 so they
-        # share the cycles already reserved for gazebo and stay off of the
-        # camera/pose cores 0-1.
+        # GUI client attaches to the running headless server; ``rviz2``
+        # opens the demo config.  Both are pinned to the gazebo cores
+        # (when affinity is enabled) so they share the cycles already
+        # reserved for the simulator and stay off of the camera/pose
+        # cores.  On the Jetson + 8-core x86 we leave them unpinned.
         return [
             ExecuteProcess(
-                cmd=["taskset", "-c", "2,3", "gz", "sim", "-g"],
+                cmd=[*aff_prefix_cmd, *profile.gz_gui_cmd],
                 output="screen",
                 condition=condition,
             ),
@@ -232,7 +263,7 @@ def generate_launch_description() -> LaunchDescription:
                 name="rviz2",
                 arguments=["-d", rviz_cfg],
                 output="screen",
-                prefix="taskset -c 2,3",
+                prefix=aff_prefix_str,
                 condition=condition,
             ),
         ]
@@ -263,8 +294,8 @@ def generate_launch_description() -> LaunchDescription:
             # NB: default is ``true`` here even though sim.launch.py defaults
             # to ``false``.  When this demo launch is used end-to-end we want
             # gazebo server-only by default (no Ogre2 inside the gazebo
-            # process) and the GUI auto-attached as an *external* ``gz sim
-            # -g`` client below.  That way the iGPU/Mesa contention with
+            # process) and the GUI auto-attached as an *external* gz/ign
+            # client below.  That way the iGPU/Mesa contention with
             # MediaPipe disappears regardless of the operator's machine.
             default_value="true",
             description=(
@@ -305,6 +336,7 @@ def generate_launch_description() -> LaunchDescription:
                 "hand is near the body, ~2x CPU), 2=heavy."
             ),
         ),
+        LogInfo(msg="[humanoid-sim demo] " + " | ".join(profile.notes)),
         camera_tf,
         cf_camera,
         cf_delayed,

@@ -25,18 +25,44 @@ RealSense D415 ──► realsense2_camera ──► pose_estimator (MediaPipe +
 
 ## Hardware tested
 
-- Ubuntu 24.04, ROS 2 Jazzy, Gazebo Sim 8 (Harmonic)
-- Intel N100 (no GPU)
-- Intel RealSense D415
+Both host profiles below are auto-detected by ``setup.sh`` and by every
+launch file (see ``src/humanoid_mimic_bringup/launch/_machine_profile.py``).
+You don't need to pass any flags to switch between them.
+
+| profile | OS | ROS distro | Gazebo | CPU | GPU | camera |
+| --- | --- | --- | --- | --- | --- | --- |
+| desktop (original) | Ubuntu 24.04 | Jazzy | Harmonic (``gz sim``) | Intel N100 (4-core, no GPU) | none | RealSense D415 |
+| Jetson | Ubuntu 22.04 (L4T R36) | Humble | Fortress (``ign gazebo``) | Jetson AGX Orin (8x Cortex-A78AE) | Tegra integrated | RealSense D457 |
+
+The two profiles disagree on:
+
+- The Gazebo userspace binary (``gz sim`` vs ``ign gazebo``) and the env
+  vars it consumes (``GZ_SIM_*`` vs ``IGN_GAZEBO_*``).
+- The ros_gz bridge's message namespace (``gz.msgs.*`` vs
+  ``ignition.msgs.*``) and the world-plugin filenames
+  (``gz-sim-*`` vs ``ignition-gazebo-*``).
+- Whether per-process CPU pinning is applied at all (yes on the 4-core
+  N100, no on the 8-core Jetson and 8-thread x86 desktops).
+- Whether ``pip3 install --break-system-packages`` is required (yes on
+  Noble's PEP 668-enforced Python, no on Jammy).
+- Who does the depth-to-color alignment: librealsense's SDK align
+  filter on the D415-over-USB desktop path, but us (in the pose
+  estimator, from the published extrinsics) on the D457-over-GMSL2
+  Jetson path -- see the "D457 vs D415" note in *Jetson AGX Orin
+  specifics* below.
+
+All of these are picked automatically.  See *Per-machine overrides* below
+if the auto-detection makes a wrong call.
 
 ## Quick start
 
 ```bash
-# 1. One-time system + python deps (uses apt + pip; needs sudo)
+# 1. One-time system + python deps (uses apt + pip; needs sudo).
+#    Auto-detects ROS_DISTRO + Jetson and installs the right gz/ros-gz mix.
 ./setup.sh
 
-# 2. Source ROS and build
-source /opt/ros/jazzy/setup.bash
+# 2. Source ROS and build (use *your* distro -- jazzy on desktop, humble on Jetson)
+source /opt/ros/$ROS_DISTRO/setup.bash
 colcon build --symlink-install
 
 # 3. Run everything in one shell
@@ -62,6 +88,30 @@ All flags below are passed as ``arg:=value`` after the launch file:
 | ``use_rviz`` | ``false`` | ``true``, ``false`` | In-process RViz inside ``sim.launch.py``.  Off by default because we launch RViz separately via ``gui`` after a delay. |
 | ``bringup_order`` | ``camera_first`` | ``camera_first``, ``gazebo_first`` | ``gazebo_first`` lets gazebo's startup storm finish before realsense's USB stream comes up; safer on CPUs with shared memory channels (N100), at the cost of ~20 s extra bring-up. |
 | ``dds`` | ``fastrtps`` | ``fastrtps``, ``cyclonedds`` | DDS implementation for the demo's processes.  Defaults to Fast-DDS to sidestep Cyclone DDS' participant-poisoning bug on this workspace; see *Troubleshooting* if you need Cyclone. |
+
+### Per-machine overrides
+
+The launch picks the Gazebo backend, CPU affinity layout and render engine
+from the ``MachineProfile`` returned by
+``src/humanoid_mimic_bringup/launch/_machine_profile.py``.  At launch time
+you'll see a ``[humanoid-sim demo] ros_distro=... | gz_backend=... |
+affinity=... | render_engine=...`` line that summarises the choice.  If
+auto-detection picks wrong, override with environment variables before
+the launch:
+
+| env var | values | what it forces |
+| --- | --- | --- |
+| ``HUMANOID_SIM_GZ_BACKEND`` | ``harmonic`` / ``fortress`` | Use ``gz sim`` or ``ign gazebo`` regardless of distro.  Useful if you've installed a non-default Gazebo userspace next to the apt-managed one. |
+| ``HUMANOID_SIM_USE_AFFINITY`` | ``0`` / ``1`` | Force-disable or force-enable ``taskset`` pinning of camera/pose vs gazebo.  Defaults: ON on <=6-core hosts (N100), OFF on >=8-core hosts (Jetson, modern x86). |
+| ``HUMANOID_SIM_RENDER_ENGINE`` | e.g. ``ogre2`` / ``ogre`` | Passed as ``--render-engine`` to ``gz sim`` / ``ign gazebo``.  Useful when EGL on the Tegra/Mesa stack misbehaves. |
+| ``HUMANOID_SIM_ALIGN_MODE`` | ``realsense`` / ``manual`` | Depth-to-color alignment strategy.  ``realsense`` uses librealsense's SDK align filter and subscribes to ``/camera/.../aligned_depth_to_color/image_raw`` -- works on x86 with a D415 over USB.  ``manual`` subscribes to the raw depth + the ``extrinsics/depth_to_color`` topic and warps each landmark in the pose estimator -- required on the Jetson AGX Orin with a D457 over GMSL2, where the SDK's align filter is silent because UVC frame metadata isn't exposed.  Defaults: ``realsense`` on x86 desktops, ``manual`` on Jetson. |
+
+Example: even on the Jetson, exercise the CPU affinity path (e.g. for
+profiling) without rebuilding:
+
+```bash
+HUMANOID_SIM_USE_AFFINITY=1 ros2 launch humanoid_mimic_bringup demo.launch.py
+```
 
 Example: hands-on-hips and arms-crossed poses look much better with the
 ``full`` MediaPipe model, if you have the CPU:
@@ -425,13 +475,94 @@ commands when fed a synthetic `/human/keypoints`.
   shared library` in the gazebo log, followed by spawners that hang on
   `waiting for service /controller_manager/list_controllers`, and a
   G1 whose arms swing freely under gravity**: gazebo can't find
-  `libgz_ros2_control-system.so` (in `/opt/ros/jazzy/lib`) because the
-  custom `gz sim` ExecuteProcess we use (so we can `taskset` it) doesn't
-  go through `ros_gz_sim`'s launch file, which is what normally folds
-  `LD_LIBRARY_PATH` into `GZ_SIM_SYSTEM_PLUGIN_PATH`.  `sim.launch.py`
-  now does that injection itself; if you still see the error, double-check
-  that `/opt/ros/jazzy/setup.bash` was sourced *before* `ros2 launch`
-  (otherwise `LD_LIBRARY_PATH` has no ROS entries to inherit).
+  `libgz_ros2_control-system.so` (in `/opt/ros/<distro>/lib`) because the
+  custom `gz sim` / `ign gazebo` ExecuteProcess we use (so we can
+  ``taskset`` it) doesn't go through `ros_gz_sim`'s launch file, which is
+  what normally folds `LD_LIBRARY_PATH` into `GZ_SIM_SYSTEM_PLUGIN_PATH`
+  (or its Fortress sibling).  `sim.launch.py` now does that injection
+  itself for both prefixes; if you still see the error, double-check
+  that `/opt/ros/$ROS_DISTRO/setup.bash` was sourced *before* `ros2
+  launch` (otherwise `LD_LIBRARY_PATH` has no ROS entries to inherit).
+- **On the Jetson: `Unknown message type [8]` floods the
+  ``parameter_bridge`` / ``ros_gz_sim create`` logs, and ``create`` keeps
+  printing ``Requesting list of world names`` forever**: this is the
+  Fortress-vs-Harmonic transport mismatch.  The apt-installed
+  ``ros-humble-ros-gz-*`` and ``ros-humble-gz-ros2-control`` packages on
+  Ubuntu 22.04 are linked against ``libignition-gazebo6`` /
+  ``libignition-transport11`` (Fortress), but ``gz sim`` from
+  ``gz-harmonic`` uses ``libgz-transport13``.  They cannot see each
+  other, so ``create`` polls the Fortress transport namespace forever
+  while the Harmonic server is publishing on the gz namespace.  The
+  launch now auto-picks ``ign gazebo`` (Fortress) on Humble for this
+  reason.  If you've replaced the apt-installed ros_gz with a source
+  build against Harmonic and want to use ``gz sim`` instead, override
+  with ``HUMANOID_SIM_GZ_BACKEND=harmonic ros2 launch ...``.
+
+### Jetson AGX Orin / Ubuntu 22.04 / Humble specifics
+
+Things that differ from the Intel N100 desktop reference setup:
+
+- **ROS distro is Humble.**  ``setup.sh`` detects ``ROS_DISTRO=humble`` and
+  installs ``ros-humble-*`` instead of ``ros-jazzy-*``.  Source
+  ``/opt/ros/humble/setup.bash`` before ``colcon build``.
+- **Gazebo backend is Fortress, not Harmonic.**  The apt-installed
+  ``ros-humble-ros-gz-*`` is built against Ignition Fortress, so the
+  launch uses ``ign gazebo``.  Both backends can coexist on disk
+  (``gz-harmonic`` and ``ignition-fortress`` are unrelated debs); the
+  launch chooses one and pins all environment variables (``GZ_SIM_*`` and
+  ``IGN_GAZEBO_*``) so a stray export from another shell doesn't
+  cross-wire them.
+- **No CPU pinning.**  The Jetson AGX Orin has 8 Cortex-A78AE cores --
+  enough that ``taskset`` is unnecessary and even mildly harmful (it
+  caps total parallelism).  The profile turns affinity off automatically
+  for ``cpu_count >= 8``.  Force it on with
+  ``HUMANOID_SIM_USE_AFFINITY=1`` if you want to reproduce the N100 path
+  for comparison.
+- **MediaPipe still runs on CPU.**  The Jetson's Tegra GPU is available
+  to OpenGL/Vulkan but the prebuilt MediaPipe wheel for aarch64 only
+  ships the XNNPACK CPU delegate; you'll see ``Created TensorFlow Lite
+  XNNPACK delegate for CPU`` in the log on both hosts.  Inference is
+  comfortably under the 30 Hz frame budget on the Orin's CPU even at
+  ``model_complexity:=1``.
+- **D457 vs D415: depth-to-color alignment is done in our code, not the
+  SDK.**  Both cameras stream 640x480x30 RGB and depth identically.  The
+  difference is the connection: the D415 sits on USB-3 with full UVC
+  frame metadata, so librealsense's depth-to-color align filter
+  paires frames and publishes ``aligned_depth_to_color/image_raw`` at
+  30 Hz.  The D457 on the Jetson AGX Orin developer kit usually
+  enumerates as ``/dev/video-rs-depth-0`` -- the GMSL2/CSI path -- and
+  that backend does *not* expose UVC frame metadata, so the SDK align
+  filter silently drops every depth frame.  The
+  ``aligned_depth_to_color/*`` topics get advertised (subscribers
+  match!), ``align_depth.enable=true`` and ``enable_sync=true`` look
+  set in ``ros2 param get``, but the heartbeat in the pose estimator
+  sits at ``depth=none info=none`` forever.  We verified the same
+  silence with the upstream example
+  ``/opt/ros/humble/share/realsense2_camera/examples/align_depth/rs_align_depth_launch.py``,
+  so this isn't our launch's fault -- it's a metadata issue baked
+  into the JetPack realsense MIPI backend.
+
+  The workaround in this repo: ``MachineProfile.align_mode='manual'``
+  on Jetson tells ``camera.launch.py`` to leave the SDK's align filter
+  off and to subscribe to ``/camera/camera/depth/image_rect_raw``
+  instead.  ``PoseEstimatorNode`` then warps each MediaPipe landmark
+  from the color image into the depth image using the
+  ``/camera/camera/extrinsics/depth_to_color`` topic + the
+  ``depth/camera_info`` intrinsics, samples depth at the warped pixel,
+  and converts back to the color optical frame.  On the D457 the
+  baseline is ~5.9 cm; the iteration converges in 1-2 passes.
+
+  On x86 with a D415, ``align_mode='realsense'`` is the default and
+  uses the SDK path unchanged.  Force the manual path anywhere with
+  ``HUMANOID_SIM_ALIGN_MODE=manual`` (useful if you're swapping
+  between cameras or debugging the SDK align filter on a USB-3 D45x
+  that's misbehaving for other reasons).
+- Two other Jetson-specific things to watch: (a) "Could not set param:
+  rgb_camera.exposure with 0" is a benign warning --
+  ``ros-humble-realsense2-camera`` ships a slightly different default
+  exposure schema than the upstream node, and (b) the D457 has a
+  longer USB cable than the D415 so its startup re-enumeration window
+  (see *USB re-enumeration* troubleshooting above) is a bit smaller.
 
 ## Credits / licenses
 
