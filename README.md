@@ -44,10 +44,31 @@ source install/setup.bash
 ros2 launch humanoid_mimic_bringup demo.launch.py
 ```
 
-The first launch downloads the MediaPipe `pose_landmarker_lite.task` model
-to `~/.cache/humanoid_pose_estimator/models/` (≈5.6 MB).  Set parameter
-`model_complexity: 1` for the `full` variant or `2` for `heavy` if you have
-the CPU headroom.
+That single command brings up the camera, MediaPipe pose estimator,
+retargeter, Gazebo (server-only, headless by default), the G1 with its
+controllers, RViz, and the Gazebo GUI client.  Bring-up takes ~25 s.  The
+first launch also downloads the MediaPipe ``pose_landmarker_lite.task``
+model to ``~/.cache/humanoid_pose_estimator/models/`` (~5.6 MB).
+
+### Useful launch arguments
+
+All flags below are passed as ``arg:=value`` after the launch file:
+
+| arg | default | choices | what it does |
+| --- | --- | --- | --- |
+| ``model_complexity`` | ``0`` | ``0``, ``1``, ``2`` | MediaPipe Pose model: 0=lite (~80 ms infer on N100), 1=full (~150 ms, much better wrist/elbow localization when the hand is near the body), 2=heavy (~400 ms, slower than the capture rate). |
+| ``gui`` | ``true`` | ``true``, ``false`` | Auto-attach the Gazebo GUI + RViz a few seconds after the pipeline is up.  Set ``false`` for fully headless runs (SSH, remote box). |
+| ``headless`` | ``true`` | ``true``, ``false`` | Run Gazebo server-only (no Ogre2 inside the gazebo process).  Keep ``true`` on a shared-iGPU machine so the gazebo renderer doesn't fight MediaPipe's EGL context. |
+| ``use_rviz`` | ``false`` | ``true``, ``false`` | In-process RViz inside ``sim.launch.py``.  Off by default because we launch RViz separately via ``gui`` after a delay. |
+| ``bringup_order`` | ``camera_first`` | ``camera_first``, ``gazebo_first`` | ``gazebo_first`` lets gazebo's startup storm finish before realsense's USB stream comes up; safer on CPUs with shared memory channels (N100), at the cost of ~20 s extra bring-up. |
+| ``dds`` | ``fastrtps`` | ``fastrtps``, ``cyclonedds`` | DDS implementation for the demo's processes.  Defaults to Fast-DDS to sidestep Cyclone DDS' participant-poisoning bug on this workspace; see *Troubleshooting* if you need Cyclone. |
+
+Example: hands-on-hips and arms-crossed poses look much better with the
+``full`` MediaPipe model, if you have the CPU:
+
+```bash
+ros2 launch humanoid_mimic_bringup demo.launch.py model_complexity:=1
+```
 
 ## Packages
 
@@ -65,12 +86,23 @@ the CPU headroom.
     G1's left arm so the simulation looks like a mirror to the operator.
   - `smoothing_alpha` (double, default `0.4`) — exponential filter on joint commands.
   - `command_rate_hz` (double, default `30.0`).
+  - `head_to_waist_gain` (double, default `0.7`) — mixes operator head yaw into
+    `waist_yaw_joint` since the G1 has no neck joint.  See *Head tracking* below.
+  - `debug_log_period_s` (double, default `2.0`) — periodic dump of commanded
+    joint angles to the launch console.  Set to `0` to silence.
 - `humanoid_pose_estimator` ROS params:
   - `min_confidence` (double, default `0.5`) — minimum MediaPipe landmark visibility.
   - `depth_patch` (int, default `5`) — pixel half-window for median depth lookup.
+  - `model_complexity` (int, default `0`) — see the launch-arg of the same name above.
+  - `wrist_correction` / `elbow_correction` (bool, default `true`) — world-landmark-anchored
+    depth-bleed fix for arms-near-body poses.  See *"Hand near body" poses straighten one
+    arm* below.
+  - `wrist_forearm_tol_m` / `elbow_upper_arm_tol_m` (double, default `0.05`) —
+    stereo-vs.-world-landmark limb-length disagreement that triggers a re-projection.
 
-See [`src/humanoid_mimic_bringup/config`](src/humanoid_mimic_bringup/config) for the
-controller and retargeter configuration.
+See [`src/humanoid_mimic_bringup/config/retargeter.yaml`](src/humanoid_mimic_bringup/config/retargeter.yaml)
+for the canonical defaults of every parameter above plus the per-joint
+sign / offset / limit tables.
 
 ## Calibration / operator setup
 
@@ -199,38 +231,57 @@ ros2 param set /humanoid_retargeter joint_signs.right_shoulder_yaw_joint +1.0
 ### "Hand near body" poses straighten one arm
 
 When you put a hand on your hip or fold your arms across your chest, the
-wrist landmark sits in pixel-space *immediately next to your torso*.  The
-``humanoid_pose_estimator`` reads the wrist's depth as the median over an
-11x11 patch (``depth_patch=5``).  When part of that patch lands on the body
-behind your hand, the median snaps backward by ~10-30 cm.  The 3D wrist
-then collapses onto the torso plane, the elbow-to-wrist vector loses its
-forward component, and the IK reports ``elbow_angle`` near zero -- the arm
-visually stays half-extended.  Critically this misfires *asymmetrically*:
-which patch pixels fall on hand vs. body depends on subpixel offsets, so
-one side can blow up while the other looks fine.
+wrist (and sometimes the elbow) landmark sits in pixel-space *immediately
+next to your torso*.  The ``humanoid_pose_estimator`` reads each joint's
+depth as the median over an 11x11 patch (``depth_patch=5``).  When part of
+that patch lands on the body behind the limb, the median snaps backward
+by ~10-30 cm.  The 3D wrist (or elbow) then collapses onto the torso
+plane, the elbow-to-wrist vector loses its forward/inward component, and
+the IK reports ``elbow_angle`` near zero -- the arm visually stays
+half-extended.  Critically this misfires *asymmetrically*: which patch
+pixels fall on limb vs. body depends on subpixel offsets, so one side
+can blow up while the other looks fine.
 
-The pose estimator has a wrist-depth sanity check that catches this.  It
-compares the 3D forearm length to MediaPipe's metric world-landmark
-forearm length, and if the two disagree by more than
-``wrist_forearm_tol_m`` (default 10 cm), it back-projects the wrist pixel
-at the depth that *does* match the world-landmark forearm length (closed
-form, single quadratic).  The wrist pixel is always reliable -- only its
-depth is the failure point.  Corrected wrists are drawn as magenta rings
-in ``/human/debug_image``.
+The pose estimator runs a two-pass world-landmark-anchored fix per arm,
+``shoulder -> elbow`` then ``elbow -> wrist``.  Each pass compares the
+3D limb length from stereo against MediaPipe's metric
+``pose_world_landmarks`` limb length; if they disagree by more than the
+matching ``*_tol_m`` parameter (default 5 cm), it back-projects the
+distal joint's pixel at the depth that *does* match the world-landmark
+length (closed form, single quadratic, pick the nearer of the two
+positive roots since the depth bleed is always *behind* the true joint).
+The distal-joint pixel is always reliable -- only the depth is the
+failure point.
 
-Tunable parameters (declared in ``pose_estimator_node.py``):
+Corrected joints are drawn in ``/human/debug_image``:
 
-| parameter            | default | meaning                                                                  |
-| -------------------- | ------- | ------------------------------------------------------------------------ |
-| ``wrist_correction``    | ``true``  | Set ``false`` to disable.  Reach-back poses (rare) are the case to disable for. |
-| ``wrist_forearm_tol_m`` | ``0.10``  | Stereo vs. world-landmark forearm-length disagreement that triggers a re-projection, in meters. |
+  - **magenta** ring on a wrist that was re-projected
+  - **cyan** ring on an elbow that was re-projected
 
-If you still see one arm not bending all the way for hands-on-hips and the
-magenta rings are NOT showing, the elbow's depth is also bleeding (a
-deeper failure that the current correction can't fix).  Move 20-30 cm
-closer to the camera, or use the heavier MediaPipe model
-(``model_complexity 1`` or ``2``) -- those have better 2D wrist
-localization which reduces the patch-bleed in the first place.
+The pose estimator's 1 Hz heartbeat also counts how many corrections
+fired in the last second:
+
+```
+hb: in=9 out=9 infer=82ms idle=0.1s (depth=ok, info=ok) fix(el=3,wr=7)
+```
+
+If ``el=0`` and ``wr=0`` for a pose you *expect* to trigger (e.g.
+hands-on-hips), MediaPipe's 2D landmarks must already be giving stereo
+the right depth -- no correction needed.  If you're still seeing visual
+asymmetry in that case, the issue is 2D landmark accuracy, not depth.
+Bump ``model_complexity`` to ``1`` (full) or ``2`` (heavy) -- those
+have substantially better wrist/elbow localization when limbs occlude
+the torso.
+
+Tunable parameters (defaults in ``retargeter.yaml`` under the
+``humanoid_pose_estimator`` block):
+
+| parameter                | default | meaning |
+| ------------------------ | ------- | ------- |
+| ``wrist_correction``        | ``true``  | Set ``false`` to disable the elbow->wrist pass.  Reach-back poses (the rare case where the wrist is *behind* the elbow in depth) are the case to disable for. |
+| ``wrist_forearm_tol_m``     | ``0.05``  | Stereo vs. world-landmark forearm-length disagreement that triggers a wrist re-projection, in meters. |
+| ``elbow_correction``        | ``true``  | Set ``false`` to disable the shoulder->elbow pass. |
+| ``elbow_upper_arm_tol_m``   | ``0.05``  | Stereo vs. world-landmark upper-arm-length disagreement that triggers an elbow re-projection, in meters. |
 
 ### Head tracking
 
@@ -260,10 +311,10 @@ source install/setup.bash
 python3 -m pytest src/humanoid_retargeter/test -v
 ```
 
-There are 18 tests covering the body-frame construction, per-arm angles,
-the mirror swap, and a live integration test that spins the retargeter node
-and verifies it publishes `Float64MultiArray` commands when fed a synthetic
-`/human/keypoints`.
+There are 19 tests covering the body-frame construction, per-arm angles,
+the mirror swap, head-yaw estimation, and a live integration test that
+spins the retargeter node and verifies it publishes `Float64MultiArray`
+commands when fed a synthetic `/human/keypoints`.
 
 ## Known caveats
 
