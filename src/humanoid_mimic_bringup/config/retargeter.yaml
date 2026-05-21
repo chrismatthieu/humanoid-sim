@@ -122,6 +122,25 @@ humanoid_pose_estimator:
     output_frame: camera_color_optical_frame
     min_confidence: 0.5
     depth_patch: 5         # half-window in pixels for median depth lookup
-    model_complexity: 0    # 0=lite (fast on CPU), 1=full, 2=heavy
+    # 0=lite (default, ~80 ms infer on N100), 1=full (~150 ms, much more
+    # accurate 2D landmarks especially for the wrist when the hand is
+    # near the body), 2=heavy (~400 ms, slower than the 30 Hz capture
+    # rate -- use only if you have CPU to burn).  Override at launch
+    # time with the ``model_complexity:=`` launch arg in demo.launch.py
+    # rather than editing this YAML by hand.
+    model_complexity: 0
     publish_debug_image: true
     publish_markers: true
+    # Depth-bleed sanity checks for the elbow & wrist, anchored on
+    # MediaPipe's metric world-landmark limb lengths.  See the
+    # _correct_distal_depth comment in pose_estimator_node.py for the
+    # geometry; the short version is that hands-on-hips and folded-arms
+    # poses make the wrist's (and sometimes elbow's) depth bleed into
+    # the torso behind the limb, collapsing the 3D arm onto the body
+    # plane.  ``*_tol_m`` is the disagreement between stereo and
+    # world-landmark limb length (meters) that triggers a re-projection
+    # of the distal joint along its pixel back-projection ray.
+    wrist_correction: true
+    wrist_forearm_tol_m: 0.05
+    elbow_correction: true
+    elbow_upper_arm_tol_m: 0.05

@@ -196,6 +196,42 @@ For *forearm twist* / hand direction (not bend), the culprit is
 ros2 param set /humanoid_retargeter joint_signs.right_shoulder_yaw_joint +1.0
 ```
 
+### "Hand near body" poses straighten one arm
+
+When you put a hand on your hip or fold your arms across your chest, the
+wrist landmark sits in pixel-space *immediately next to your torso*.  The
+``humanoid_pose_estimator`` reads the wrist's depth as the median over an
+11x11 patch (``depth_patch=5``).  When part of that patch lands on the body
+behind your hand, the median snaps backward by ~10-30 cm.  The 3D wrist
+then collapses onto the torso plane, the elbow-to-wrist vector loses its
+forward component, and the IK reports ``elbow_angle`` near zero -- the arm
+visually stays half-extended.  Critically this misfires *asymmetrically*:
+which patch pixels fall on hand vs. body depends on subpixel offsets, so
+one side can blow up while the other looks fine.
+
+The pose estimator has a wrist-depth sanity check that catches this.  It
+compares the 3D forearm length to MediaPipe's metric world-landmark
+forearm length, and if the two disagree by more than
+``wrist_forearm_tol_m`` (default 10 cm), it back-projects the wrist pixel
+at the depth that *does* match the world-landmark forearm length (closed
+form, single quadratic).  The wrist pixel is always reliable -- only its
+depth is the failure point.  Corrected wrists are drawn as magenta rings
+in ``/human/debug_image``.
+
+Tunable parameters (declared in ``pose_estimator_node.py``):
+
+| parameter            | default | meaning                                                                  |
+| -------------------- | ------- | ------------------------------------------------------------------------ |
+| ``wrist_correction``    | ``true``  | Set ``false`` to disable.  Reach-back poses (rare) are the case to disable for. |
+| ``wrist_forearm_tol_m`` | ``0.10``  | Stereo vs. world-landmark forearm-length disagreement that triggers a re-projection, in meters. |
+
+If you still see one arm not bending all the way for hands-on-hips and the
+magenta rings are NOT showing, the elbow's depth is also bleeding (a
+deeper failure that the current correction can't fix).  Move 20-30 cm
+closer to the camera, or use the heavier MediaPipe model
+(``model_complexity 1`` or ``2``) -- those have better 2D wrist
+localization which reduces the patch-bleed in the first place.
+
 ### Head tracking
 
 The G1 URDF in this workspace (``g1_29dof_lock_waist.urdf``) has

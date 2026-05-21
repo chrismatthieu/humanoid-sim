@@ -139,6 +139,9 @@ def generate_launch_description() -> LaunchDescription:
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([bringup, "launch", "camera.launch.py"])
         ),
+        launch_arguments={
+            "model_complexity": LaunchConfiguration("model_complexity"),
+        }.items(),
         condition=is_camera_first,
     )
     cf_delayed = TimerAction(
@@ -175,6 +178,9 @@ def generate_launch_description() -> LaunchDescription:
                         bringup, "launch", "camera.launch.py",
                     ])
                 ),
+                launch_arguments={
+                    "model_complexity": LaunchConfiguration("model_complexity"),
+                }.items(),
             ),
         ],
         condition=is_gazebo_first,
@@ -287,6 +293,16 @@ def generate_launch_description() -> LaunchDescription:
                 "realsense's USB stream comes up, which sidesteps the "
                 "cross-affinity disturbance that kills the camera on "
                 "shared-memory-channel CPUs like the N100."
+            ),
+        ),
+        DeclareLaunchArgument(
+            "model_complexity",
+            default_value="0",
+            choices=["0", "1", "2"],
+            description=(
+                "MediaPipe Pose model: 0=lite (default, fast on N100), "
+                "1=full (better wrist/elbow landmark accuracy when the "
+                "hand is near the body, ~2x CPU), 2=heavy."
             ),
         ),
         camera_tf,

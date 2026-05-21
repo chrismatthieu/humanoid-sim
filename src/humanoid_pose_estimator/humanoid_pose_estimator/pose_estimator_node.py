@@ -106,6 +106,28 @@ class PoseEstimatorNode(Node):
         self.declare_parameter("model_cache_dir", "")  # default ~/.cache/humanoid_pose_estimator/models
         self.declare_parameter("publish_debug_image", True)
         self.declare_parameter("publish_markers", True)
+        # Wrist-depth sanity check.  When the operator's hand is near the
+        # body (e.g. hands resting on the hips, arms folded across chest),
+        # the median over the depth patch around the wrist pixel can bleed
+        # into the torso behind the hand and snap the wrist's 3D position
+        # backward by 10-30 cm.  That makes the IK think the forearm is
+        # almost colinear with the upper arm (under-bent elbow).  When
+        # enabled, this re-projects the wrist pixel at a depth that makes
+        # the elbow-to-wrist distance match MediaPipe's metric
+        # ``pose_world_landmarks`` forearm length.
+        self.declare_parameter("wrist_correction", True)
+        self.declare_parameter("wrist_forearm_tol_m", 0.05)
+        # Elbow-depth sanity check.  Same mechanism as the wrist correction,
+        # one link upstream: re-back-project the elbow if its stereo
+        # shoulder-to-elbow length disagrees with MediaPipe's world-landmark
+        # upper-arm length by more than ``elbow_upper_arm_tol_m``.  This
+        # matters when the operator's elbow rests against the body (hands
+        # on hips, folded arms) -- depth lookups around the elbow then
+        # bleed into the torso, anchoring everything downstream (including
+        # the wrist correction) to a wrong elbow position.  Runs *before*
+        # the wrist correction so the wrist sees the corrected elbow.
+        self.declare_parameter("elbow_correction", True)
+        self.declare_parameter("elbow_upper_arm_tol_m", 0.05)
 
         gp = self.get_parameter
         self.color_topic: str = gp("color_topic").value
@@ -117,6 +139,13 @@ class PoseEstimatorNode(Node):
         self.model_complexity: int = int(gp("model_complexity").value)
         self.publish_debug_image: bool = bool(gp("publish_debug_image").value)
         self.publish_markers: bool = bool(gp("publish_markers").value)
+        self.wrist_correction: bool = bool(gp("wrist_correction").value)
+        self.wrist_forearm_tol_m: float = float(gp("wrist_forearm_tol_m").value)
+        self.elbow_correction: bool = bool(gp("elbow_correction").value)
+        self.elbow_upper_arm_tol_m: float = float(gp("elbow_upper_arm_tol_m").value)
+        # Diagnostic counters for the heartbeat.  Reset each tick.
+        self._elbow_fix_count = 0
+        self._wrist_fix_count = 0
 
         # Resolve the model file.
         model_path_param = str(gp("model_path").value)
@@ -390,6 +419,51 @@ class PoseEstimatorNode(Node):
             return 0.0
         return float(np.median(valid))
 
+    @staticmethod
+    def _solve_wrist_depth_for_forearm(
+        u_w: float,
+        v_w: float,
+        cx: float,
+        cy: float,
+        fx: float,
+        fy: float,
+        elbow_xyz: tuple[float, float, float],
+        forearm_len_m: float,
+        prefer_nearer: bool = True,
+    ) -> Optional[float]:
+        """Solve for the wrist's camera-Z so that the back-projected wrist
+        3D point is exactly ``forearm_len_m`` away from ``elbow_xyz``.
+
+        Back-projection from a pinhole camera at depth ``Z`` gives
+        ``P_w = (a*Z, b*Z, Z)`` where ``a = (u - cx)/fx`` and
+        ``b = (v - cy)/fy``.  Imposing ``||P_w - P_e|| == L`` yields a
+        quadratic in ``Z`` with up to two positive roots: the two points
+        where the wrist back-projection ray intersects the sphere of
+        radius ``L`` around the elbow.  ``prefer_nearer=True`` returns the
+        smaller (closer to camera) root, which is the right answer in
+        the depth-bleed scenario this helper exists for -- when the
+        depth patch mistakenly samples the body behind the hand, the
+        true wrist always sits in *front* of the bled-into surface, so
+        the closer root is correct.  Returns None if no positive real
+        root exists.
+        """
+        X_e, Y_e, Z_e = elbow_xyz
+        a = (u_w - cx) / fx
+        b = (v_w - cy) / fy
+        A = a * a + b * b + 1.0
+        B = -2.0 * (a * X_e + b * Y_e + Z_e)
+        C = X_e * X_e + Y_e * Y_e + Z_e * Z_e - forearm_len_m * forearm_len_m
+        disc = B * B - 4.0 * A * C
+        if disc < 0.0:
+            return None
+        sq = float(np.sqrt(disc))
+        z1 = (-B + sq) / (2.0 * A)
+        z2 = (-B - sq) / (2.0 * A)
+        candidates = [z for z in (z1, z2) if z > 0.05]
+        if not candidates:
+            return None
+        return min(candidates) if prefer_nearer else max(candidates)
+
     def _heartbeat(self) -> None:
         """Independent 1 Hz heartbeat.
 
@@ -403,16 +477,25 @@ class PoseEstimatorNode(Node):
             if self._resubscribe_count
             else ""
         )
+        fixes = ""
+        if self._elbow_fix_count or self._wrist_fix_count:
+            fixes = (
+                f" fix(el={self._elbow_fix_count},"
+                f"wr={self._wrist_fix_count})"
+            )
         self.get_logger().info(
             f"hb: in={self._frames_in} out={self._frames_out} "
             f"infer={self._last_infer_ms:.0f}ms "
             f"idle={idle_s:.1f}s "
             f"(depth={'ok' if self._latest_depth else 'none'}, "
             f"info={'ok' if self._cam_info else 'none'})"
+            f"{fixes}"
             f"{resub_str}"
         )
         self._frames_in = 0
         self._frames_out = 0
+        self._elbow_fix_count = 0
+        self._wrist_fix_count = 0
 
     # ------------------------------------------------------------------ callback
 
@@ -499,6 +582,25 @@ class PoseEstimatorNode(Node):
                     color_dot = (0, 255, 0) if pose.orientation.w > 0 else (0, 0, 255)
                     cv2.circle(debug_img, (int(u_color), int(v_color)), 4, color_dot, -1)
 
+            world_landmarks = (
+                result.pose_world_landmarks[0]
+                if getattr(result, "pose_world_landmarks", None)
+                else None
+            )
+            if self.wrist_correction or self.elbow_correction:
+                self._correct_arm_depths(
+                    out,
+                    landmarks=landmarks,
+                    world_landmarks=world_landmarks,
+                    w_color=w_color,
+                    h_color=h_color,
+                    cx=cx,
+                    cy=cy,
+                    fx=fx,
+                    fy=fy,
+                    debug_img=debug_img,
+                )
+
             if debug_img is not None:
                 for a, b in SKELETON_EDGES:
                     pa = out.poses[int(a)]
@@ -522,6 +624,169 @@ class PoseEstimatorNode(Node):
             self.pub_dbg.publish(dbg_msg)
 
         self._frames_out += 1
+
+    # Adult anthropometric defaults & clamps used by the depth-bleed fix.
+    # Upper-arm and forearm both live in the 18-40 cm range for adults;
+    # clamping protects us from world-landmark blow-ups (single bad frame
+    # producing a 1.2 m "forearm" can otherwise poison the back-projection
+    # for several smoothed frames downstream).
+    _DEFAULT_UPPER_ARM_M = 0.30
+    _DEFAULT_FOREARM_M = 0.27
+    _LIMB_MIN_M = 0.18
+    _LIMB_MAX_M = 0.40
+
+    def _correct_distal_depth(
+        self,
+        out: PoseArray,
+        *,
+        anchor_kp: Kp,
+        distal_kp: Kp,
+        default_len_m: float,
+        tol_m: float,
+        landmarks: list,
+        world_landmarks: Optional[list],
+        w_color: int,
+        h_color: int,
+        cx: float,
+        cy: float,
+        fx: float,
+        fy: float,
+        debug_img: Optional[np.ndarray],
+        debug_color: tuple[int, int, int],
+    ) -> int:
+        """Re-back-project ``distal_kp`` so the 3D ``anchor_kp -> distal_kp``
+        distance matches MediaPipe's world-landmark limb length.
+
+        Same trick as the wrist correction (and uses the same closed-form
+        quadratic), generalised so the elbow can be corrected too: the
+        anchor's 3D position is trusted (it's higher up the kinematic chain
+        and less likely to bleed into the body in this pose), and we
+        re-solve for the distal joint's Z along its pixel back-projection
+        ray to match the world-landmark limb length.
+
+        Returns 1 if a correction was applied, 0 if not.
+        """
+        anchor_pose = out.poses[int(anchor_kp)]
+        distal_pose = out.poses[int(distal_kp)]
+        if anchor_pose.orientation.w <= 0.0:
+            return 0
+
+        md = landmarks[MEDIAPIPE_INDEX[distal_kp]]
+        if float(getattr(md, "visibility", 0.0)) < self.min_confidence:
+            return 0
+
+        P_a = (
+            anchor_pose.position.x,
+            anchor_pose.position.y,
+            anchor_pose.position.z,
+        )
+        if distal_pose.orientation.w > 0.0:
+            dx = distal_pose.position.x - P_a[0]
+            dy = distal_pose.position.y - P_a[1]
+            dz = distal_pose.position.z - P_a[2]
+            d_observed = float(np.sqrt(dx * dx + dy * dy + dz * dz))
+        else:
+            d_observed = float("inf")
+
+        if world_landmarks is not None:
+            wa = world_landmarks[MEDIAPIPE_INDEX[anchor_kp]]
+            wd = world_landmarks[MEDIAPIPE_INDEX[distal_kp]]
+            limb_len_m = float(np.sqrt(
+                (wd.x - wa.x) ** 2
+                + (wd.y - wa.y) ** 2
+                + (wd.z - wa.z) ** 2
+            ))
+        else:
+            limb_len_m = default_len_m
+
+        limb_len_m = float(np.clip(limb_len_m, self._LIMB_MIN_M, self._LIMB_MAX_M))
+
+        needs_fix = (
+            d_observed == float("inf")
+            or abs(d_observed - limb_len_m) > tol_m
+        )
+        if not needs_fix:
+            return 0
+
+        u_d = md.x * w_color
+        v_d = md.y * h_color
+        z_new = self._solve_wrist_depth_for_forearm(
+            u_w=u_d, v_w=v_d,
+            cx=cx, cy=cy, fx=fx, fy=fy,
+            elbow_xyz=P_a,
+            forearm_len_m=limb_len_m,
+        )
+        if z_new is None:
+            return 0
+
+        distal_pose.position.x = (u_d - cx) * z_new / fx
+        distal_pose.position.y = (v_d - cy) * z_new / fy
+        distal_pose.position.z = z_new
+        distal_pose.orientation.w = max(
+            float(getattr(md, "visibility", 0.0)),
+            self.min_confidence,
+        )
+        if debug_img is not None:
+            cv2.circle(
+                debug_img, (int(u_d), int(v_d)), 7, debug_color, 2
+            )
+        return 1
+
+    def _correct_arm_depths(
+        self,
+        out: PoseArray,
+        *,
+        landmarks: list,
+        world_landmarks: Optional[list],
+        w_color: int,
+        h_color: int,
+        cx: float,
+        cy: float,
+        fx: float,
+        fy: float,
+        debug_img: Optional[np.ndarray],
+    ) -> None:
+        """Run depth-bleed correction on both arms.
+
+        Two passes per side: shoulder -> elbow first (so the wrist
+        correction below sees the corrected elbow), then elbow -> wrist.
+        Corrected joints are drawn in the debug image: magenta rings for
+        the wrist, cyan rings for the elbow.
+        """
+        for shoulder, elbow, wrist in (
+            (Kp.LEFT_SHOULDER,  Kp.LEFT_ELBOW,  Kp.LEFT_WRIST),
+            (Kp.RIGHT_SHOULDER, Kp.RIGHT_ELBOW, Kp.RIGHT_WRIST),
+        ):
+            if self.elbow_correction:
+                self._elbow_fix_count += self._correct_distal_depth(
+                    out,
+                    anchor_kp=shoulder,
+                    distal_kp=elbow,
+                    default_len_m=self._DEFAULT_UPPER_ARM_M,
+                    tol_m=self.elbow_upper_arm_tol_m,
+                    landmarks=landmarks,
+                    world_landmarks=world_landmarks,
+                    w_color=w_color,
+                    h_color=h_color,
+                    cx=cx, cy=cy, fx=fx, fy=fy,
+                    debug_img=debug_img,
+                    debug_color=(255, 255, 0),  # cyan
+                )
+            if self.wrist_correction:
+                self._wrist_fix_count += self._correct_distal_depth(
+                    out,
+                    anchor_kp=elbow,
+                    distal_kp=wrist,
+                    default_len_m=self._DEFAULT_FOREARM_M,
+                    tol_m=self.wrist_forearm_tol_m,
+                    landmarks=landmarks,
+                    world_landmarks=world_landmarks,
+                    w_color=w_color,
+                    h_color=h_color,
+                    cx=cx, cy=cy, fx=fx, fy=fy,
+                    debug_img=debug_img,
+                    debug_color=(255, 0, 255),  # magenta
+                )
 
     def _publish_markers(self, kps: PoseArray) -> None:
         ma = MarkerArray()
